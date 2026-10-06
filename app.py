@@ -1609,8 +1609,9 @@ if "dealer_results" in st.session_state:
         use_container_width=True
     )
 
+    ```python
     # -----------------------------------------------------
-    # Excel
+    # Excel Export
     # -----------------------------------------------------
 
     try:
@@ -1629,19 +1630,18 @@ if "dealer_results" in st.session_state:
                 sheet_name="Dealers"
             )
 
+        excel_data = excel_buffer.getvalue()
+
         st.download_button(
             "📊 تحميل Excel",
-            data=excel_buffer.getvalue(),
+            data=excel_data,
             file_name="egypt_car_dealers.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-"
-                "officedocument.spreadsheetml.sheet"
-            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
 
     except Exception as e:
-
         st.warning(
             f"تعذر إنشاء ملف Excel: {e}"
         )
+```
