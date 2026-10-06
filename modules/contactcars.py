@@ -1,59 +1,32 @@
+import urllib.parse
 import requests
-import re
 from bs4 import BeautifulSoup
-from urllib.parse import quote
-
-
-CONTACTCARS_BASE = "https://www.contactcars.com"
 
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/140.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/154.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
 }
 
 
-def clean_text(text):
-    if not text:
-        return ""
-
-    text = BeautifulSoup(
-        str(text),
-        "html.parser"
-    ).get_text(" ", strip=True)
-
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def search_contactcars_dealer(dealer_name, area=""):
-    """
-    البحث عن معرض معين على ContactCars.
-
-    لا نعتبر المعرض موجوداً إلا إذا وجدنا
-    نتائج مرتبطة بالاسم.
-    """
-
+def search_contactcars(dealer_name, max_results=10):
     queries = [
         f'"{dealer_name}" site:contactcars.com',
-        f'"{dealer_name}" ContactCars',
+        f'"{dealer_name}" ContactCars Egypt',
     ]
 
-    results = []
+    all_results = []
 
     for query in queries:
 
         try:
-
             url = (
                 "https://html.duckduckgo.com/html/?q="
-                + quote(query)
+                + urllib.parse.quote(query)
             )
 
             response = requests.get(
@@ -87,8 +60,9 @@ def search_contactcars_dealer(dealer_name, area=""):
                 if not title_element or not link_element:
                     continue
 
-                title = clean_text(
-                    title_element.get_text(" ")
+                title = title_element.get_text(
+                    " ",
+                    strip=True
                 )
 
                 link = link_element.get(
@@ -99,100 +73,60 @@ def search_contactcars_dealer(dealer_name, area=""):
                 snippet = ""
 
                 if snippet_element:
-                    snippet = clean_text(
-                        snippet_element.get_text(" ")
+                    snippet = snippet_element.get_text(
+                        " ",
+                        strip=True
                     )
 
-                combined_text = (
-                    f"{title} {snippet}"
-                ).lower()
+                if link:
+                    all_results.append({
+                        "title": title,
+                        "url": link,
+                        "snippet": snippet,
+                    })
 
-                dealer_words = [
-                    word.lower()
-                    for word in dealer_name.split()
-                    if len(word) >= 3
-                ]
-
-                matched_words = 0
-
-                for word in dealer_words:
-
-                    if word in combined_text:
-                        matched_words += 1
-
-                if dealer_words:
-
-                    match_ratio = (
-                        matched_words /
-                        len(dealer_words)
-                    )
-
-                else:
-
-                    match_ratio = 0
-
-                # لازم يكون فيه تطابق واضح
-                if match_ratio < 0.5:
-                    continue
-
-                results.append({
-                    "title": title,
-                    "url": link,
-                    "snippet": snippet,
-                    "match_ratio": round(
-                        match_ratio,
-                        2
-                    )
-                })
+                if len(all_results) >= max_results:
+                    break
 
         except Exception:
             continue
 
-    # إزالة النتائج المكررة
+        if len(all_results) >= max_results:
+            break
 
+    # Remove duplicate URLs
     unique_results = {}
 
-    for result in results:
+    for result in all_results:
+        url = result.get("url", "")
 
-        url = result["url"]
-
-        if url and url not in unique_results:
+        if url:
             unique_results[url] = result
 
-    return list(
-        unique_results.values()
-    )
+    return list(unique_results.values())
 
 
-def get_contactcars_status(
-    dealer_name,
-    area=""
-):
-    """
-    التحقق من وجود المعرض على ContactCars.
-    """
-
-    results = search_contactcars_dealer(
+def get_contactcars_status(dealer_name):
+    results = search_contactcars(
         dealer_name,
-        area
+        max_results=10
     )
 
-    if not results:
+    if results:
 
         return {
-            "exists": False,
-            "listing_count": 0,
-            "monthly_activity": None,
-            "last_activity": None,
-            "results": [],
-            "status": "غير متحقق"
+            "status": "نعم",
+            "listing_count": len(results),
+            "url": results[0].get(
+                "url",
+                ""
+            ),
+            "results": results,
         }
 
     return {
-        "exists": True,
-        "listing_count": len(results),
-        "monthly_activity": None,
-        "last_activity": None,
-        "results": results,
-        "status": "تم العثور على نتائج"
+        "status": "غير متحقق",
+        "listing_count": 0,
+        "url": "",
+        "results": [],
     }
