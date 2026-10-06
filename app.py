@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import pandas as pd
 import requests
@@ -1646,4 +1645,3 @@ if "dealer_results" in st.session_state:
         st.warning(
             f"تعذر إنشاء ملف Excel: {e}"
         )
-```
