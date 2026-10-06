@@ -1,11 +1,29 @@
 import streamlit as st
 import pandas as pd
-import os
 import requests
 import urllib.parse
 import re
+from bs4 import BeautifulSoup
+from rapidfuzz import fuzz
 
-st.set_page_config(page_title="Dubizzle Lead Prospector", page_icon="🚀", layout="wide")
+# =========================================================
+# APP CONFIG
+# =========================================================
+
+st.set_page_config(
+    page_title="Egypt Car Dealer Lead Intelligence",
+    page_icon="🚗",
+    layout="wide"
+)
+
+st.title("🚗 Egypt Car Dealer Lead Intelligence")
+st.caption(
+    "البحث عن معارض السيارات في مصر والتحقق من نشاطها على Dubizzle و ContactCars"
+)
+
+# =========================================================
+# AREAS
+# =========================================================
 
 DISTRICT_OPTIONS = [
     "القاهرة - مدينة نصر",
@@ -15,182 +33,690 @@ DISTRICT_OPTIONS = [
     "القاهرة - شبرا ووسط البلد",
     "الجيزة - المهندسين والدقي",
     "الجيزة - فيصل والهرم",
-    "الجيزة - 6 أكتوبر والشيخ زايد"
+    "الجيزة - 6 أكتوبر والشيخ زايد",
 ]
 
-def fetch_real_leads_ddg(selected_districts, max_results):
-    output_file = "car_dealers_leads.xlsx"
-    if not selected_districts:
-        return None, "⚠️ يرجى اختيار منطقة واحدة على الأقل."
+# =========================================================
+# HTTP
+# =========================================================
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+}
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def clean_text(value):
+    if not value:
+        return ""
+
+    value = BeautifulSoup(str(value), "html.parser").get_text(" ")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def normalize_name(name):
+    """
+    توحيد اسم المعرض لمنع التكرار.
+    """
+
+    name = clean_text(name).lower()
+
+    replacements = {
+        "للسيارات": "",
+        "للسيارات ": "",
+        "سيارات": "",
+        "كارز": "cars",
+        "cars": "",
+        "motors": "",
+        "motor": "",
+        "auto": "",
+        "أوتو": "",
+        "او تو": "",
+        "العربية": "",
+        "egypt": "",
+        "مصر": "",
     }
 
-    real_records = []
-    seen_titles = set()
-    target_per_district = max(5, int(max_results // len(selected_districts)))
+    for old, new in replacements.items():
+        name = name.replace(old, new)
 
-    for district in selected_districts:
-        main_city = district.split(" - ")[0]
-        area_name = district.split(" - ")[-1]
+    name = re.sub(r"[^a-zA-Z0-9\u0600-\u06FF]+", " ", name)
+    name = re.sub(r"\s+", " ", name)
 
-        queries = [
-            f"معرض سيارات {area_name} {main_city}",
-            f"معارض سيارات في {area_name}",
-            f"أوتو {area_name} سيارات"
-        ]
+    return name.strip()
 
-        district_count = 0
-        for q in queries:
-            if district_count >= target_per_district or len(real_records) >= max_results:
-                break
 
-            url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
-            
-            try:
-                res = requests.get(url, headers=headers, timeout=10)
-                if res.status_code == 200:
-                    snippets = re.findall(r'<a class="result__url"[^>]*>(.*?)</a>.*?<a class="result__snippet"[^>]*>(.*?)</a>', res.text, re.DOTALL)
-                    titles = re.findall(r'<a class="result__a"[^>]*>(.*?)</a>', res.text, re.DOTALL)
+def is_similar_name(name1, name2, threshold=88):
+    """
+    مقارنة أسماء المعارض لمنع إدخال نفس المعرض أكثر من مرة.
+    """
 
-                    for idx, raw_title in enumerate(titles):
-                        clean_title = re.sub(r'<[^>]+>', '', raw_title).strip()
-                        clean_title = clean_title.replace("...", "").replace("-", " ").strip()
+    n1 = normalize_name(name1)
+    n2 = normalize_name(name2)
 
-                        if ("معرض" in clean_title or "سيارات" in clean_title or "أوتو" in clean_title or "Motors" in clean_title):
-                            if clean_title not in seen_titles and len(clean_title) < 60:
-                                seen_titles.add(clean_title)
+    if not n1 or not n2:
+        return False
 
-                                snippet_text = re.sub(r'<[^>]+>', '', snippets[idx][1]) if idx < len(snippets) else ""
-                                phone_match = re.search(r'(01[0125]\d{8})', snippet_text)
-                                phone = phone_match.group(1) if phone_match else "غير مدون برقم مباشر"
+    return fuzz.token_set_ratio(n1, n2) >= threshold
 
-                                maps_url = f"https://www.google.com/maps/search/{urllib.parse.quote(clean_title + ' ' + area_name)}"
-                                address = f"{area_name}، {main_city}"
 
-                                score = 85 if phone != "غير مدون برقم مباشر" else 65
+def extract_phone(text):
+    """
+    استخراج أرقام المحمول المصرية فقط.
+    """
 
-                                real_records.append({
-                                    "title": clean_title,
-                                    "city": main_city,
-                                    "address": address,
-                                    "phone": phone,
-                                    "link": maps_url,
-                                    "has_dubizzle_presence": "يحتاج مراجعة",
-                                    "lead_score": f"{score}/100"
-                                })
-                                district_count += 1
-                                if district_count >= target_per_district or len(real_records) >= max_results:
-                                    break
-            except Exception:
+    if not text:
+        return ""
+
+    patterns = [
+        r"01[0125]\d{8}",
+        r"\+20\s*1[0125]\s*\d{8}",
+        r"0020\s*1[0125]\s*\d{8}",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+
+        if match:
+            phone = re.sub(r"\D", "", match.group())
+
+            if phone.startswith("0020"):
+                phone = phone[2:]
+
+            if phone.startswith("20"):
+                phone = phone[2:]
+
+            if len(phone) == 11 and phone.startswith("01"):
+                return phone
+
+    return ""
+
+
+def google_maps_link(name, area):
+    query = urllib.parse.quote(f"{name} {area} Egypt")
+    return f"https://www.google.com/maps/search/{query}"
+
+
+def whatsapp_link(phone, message):
+    if not phone:
+        return ""
+
+    if not phone.startswith("01") or len(phone) != 11:
+        return ""
+
+    encoded = urllib.parse.quote(message)
+
+    return f"https://wa.me/2{phone}?text={encoded}"
+
+
+# =========================================================
+# SEARCH ENGINE
+# =========================================================
+
+def search_duckduckgo(query, max_results=20):
+
+    url = (
+        "https://html.duckduckgo.com/html/?q="
+        + urllib.parse.quote(query)
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        results = []
+
+        for result in soup.select(".result")[:max_results]:
+
+            title_element = result.select_one(".result__title")
+
+            link_element = result.select_one(".result__a")
+
+            snippet_element = result.select_one(".result__snippet")
+
+            if not title_element or not link_element:
                 continue
 
-    if not real_records:
-        return None, "❌ تعذر جلب البيانات حالياً، يرجى المحاولة مرة أخرى."
+            title = clean_text(title_element.get_text(" "))
 
-    final_df = pd.DataFrame(real_records)
-    final_df.to_excel(output_file, index=False)
-    return final_df, f"✅ تم استخراج {len(final_df)} معرض حقيقي ومباشر بنجاح!"
+            link = link_element.get("href", "")
 
-def run_outreach_direct(msg_type):
-    leads_file = "car_dealers_leads.xlsx"
-    campaign_file = "ready_whatsapp_campaign.xlsx"
-    
-    if not os.path.exists(leads_file):
-        return None, "❌ لم يتم العثور على ملف البيانات، يرجى تشغيل الجمع أولاً."
+            snippet = ""
 
-    df = pd.read_excel(leads_file)
-    if df.empty:
-        return None, "❌ ملف البيانات فارغ، يرجى تشغيل الجمع أولاً."
-
-    campaign_data = []
-    for _, row in df.iterrows():
-        title = str(row.get("title", "")).strip()
-        phone = str(row.get("phone", "")).strip()
-        city = str(row.get("city", "")).strip()
-        address = str(row.get("address", "")).strip()
-        maps_link = str(row.get("link", "")).strip()
-        score = str(row.get("lead_score", "70/100")).strip()
-        
-        if msg_type == "عروض رسمية (Formal Offer)":
-            msg = f"تحياتنا لحضرتك {title} 👋، بنتابع مع سيادتكم من دوبيزل لتطوير باقة المتاجر وترقية المشتركين في {city}."
-        else:
-            msg = f"مساء الخير {title} 👋، فريق مبيعات دوبيزل معاك! حابين نعرض عليك فرصة إدراج معارضكم معنا وعرض سياراتكم لأكثر من 5 مليون زيارة شهرياً."
-            
-        encoded_msg = urllib.parse.quote(msg)
-        
-        if phone.startswith("01") and len(phone) == 11:
-            wa_link = f"https://wa.me/2{phone}?text={encoded_msg}"
-        else:
-            wa_link = "يتطلب مراجعة الرقم"
-        
-        campaign_data.append({
-            "اسم المعرض الحقيقي": title,
-            "المدينة": city,
-            "العنوان التفصيلي": address,
-            "رقم الموبايل": phone,
-            "تقييم الجاهزية (Lead Score)": score,
-            "رابط الخريطة GPS المباشر": maps_link,
-            "رسالة الواتساب": msg,
-            "رابط الواتساب المباشر": wa_link
-        })
-
-    campaign_df = pd.DataFrame(campaign_data)
-    campaign_df.to_excel(campaign_file, index=False)
-    return campaign_df, f"✅ تم تجهيز حملة الواتساب بنجاح! عدد المعارض: {len(campaign_df)}"
-
-# --- Streamlit UI ---
-st.title("🚀 Dubizzle Lead Prospector")
-st.markdown("استخراج المعارض الحقيقية مباشرة وتجهيز حملة التواصل عبر الواتساب.")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    cities_input = st.multiselect(
-        "📌 اختر المناطق المطلوبة", 
-        options=DISTRICT_OPTIONS, 
-        default=["القاهرة - مصر الجديدة والنزهة"]
-    )
-    max_results_input = st.number_input("العدد المطلوب", min_value=5, max_value=200, value=20, step=5)
-
-with col2:
-    msg_style_input = st.radio(
-        "🎯 نبرة رسالة الواتساب", 
-        options=["ترويجي مباشر (Promotional)", "عروض رسمية (Formal Offer)"], 
-        index=0
-    )
-
-col_btn1, col_btn2 = st.columns(2)
-
-with col_btn1:
-    btn_prospect = st.button("🚀 1. ابدأ الجمع الحقيقي (Start Prospecting)", use_container_width=True)
-
-with col_btn2:
-    btn_outreach = st.button("💬 2. تجهيز حملة الواتساب", use_container_width=True)
-
-if btn_prospect:
-    with st.spinner("جاري السحب الحقيقي لجلب المعارض..."):
-        df, msg = fetch_real_leads_ddg(cities_input, max_results_input)
-        if df is not None:
-            st.success(msg)
-            st.dataframe(df)
-        else:
-            st.error(msg)
-
-if btn_outreach:
-    with st.spinner("جاري إعداد الرسائل والروابط..."):
-        df_out, msg = run_outreach_direct(msg_style_input)
-        if df_out is not None:
-            st.success(msg)
-            st.dataframe(df_out)
-            
-            with open("ready_whatsapp_campaign.xlsx", "rb") as file:
-                st.download_button(
-                    label="📥 تحميل ملف الإكسيل للواتساب",
-                    data=file,
-                    file_name="ready_whatsapp_campaign.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if snippet_element:
+                snippet = clean_text(
+                    snippet_element.get_text(" ")
                 )
+
+            results.append({
+                "title": title,
+                "link": link,
+                "snippet": snippet
+            })
+
+        return results
+
+    except Exception:
+        return []
+
+
+# =========================================================
+# DEALER DISCOVERY
+# =========================================================
+
+def discover_dealers(selected_districts, max_results):
+
+    dealers = []
+
+    seen_names = []
+
+    for district in selected_districts:
+
+        parts = district.split(" - ", 1)
+
+        city = parts[0]
+        area = parts[1] if len(parts) > 1 else district
+
+        queries = [
+            f'"معرض سيارات" "{area}"',
+            f'"معرض سيارات" "{area}" "{city}"',
+            f'"معارض سيارات" "{area}"',
+            f'"car dealer" "{area}" Egypt',
+            f'"cars" "{area}" Egypt',
+        ]
+
+        for query in queries:
+
+            results = search_duckduckgo(
+                query,
+                max_results=15
+            )
+
+            for result in results:
+
+                title = result["title"]
+                snippet = result["snippet"]
+                link = result["link"]
+
+                combined = f"{title} {snippet}".lower()
+
+                dealer_keywords = [
+                    "معرض",
+                    "سيارات",
+                    "cars",
+                    "motors",
+                    "auto",
+                    "dealer",
+                    "automotive",
+                ]
+
+                if not any(
+                    keyword.lower() in combined
+                    for keyword in dealer_keywords
+                ):
+                    continue
+
+                # -------------------------------------------------
+                # Prevent duplicates
+                # -------------------------------------------------
+
+                duplicate = False
+
+                for old_name in seen_names:
+
+                    if is_similar_name(
+                        title,
+                        old_name
+                    ):
+                        duplicate = True
+                        break
+
+                if duplicate:
+                    continue
+
+                seen_names.append(title)
+
+                phone = extract_phone(
+                    f"{title} {snippet}"
+                )
+
+                maps = google_maps_link(
+                    title,
+                    area
+                )
+
+                dealers.append({
+                    "اسم المعرض": title,
+                    "المدينة": city,
+                    "المنطقة": area,
+                    "الهاتف": phone,
+                    "Google Maps": maps,
+                    "مصدر الاكتشاف": link,
+                    "Dubizzle": "سيتم التحقق",
+                    "Dubizzle Ads": "سيتم التحقق",
+                    "Dubizzle Ads / Month": "سيتم التحقق",
+                    "ContactCars": "سيتم التحقق",
+                    "ContactCars Ads": "سيتم التحقق",
+                    "ContactCars Ads / Month": "سيتم التحقق",
+                    "آخر نشاط": "سيتم التحقق",
+                    "حالة التحقق": "يحتاج تحقق",
+                })
+
+                if len(dealers) >= max_results:
+                    return dealers
+
+    return dealers
+
+
+# =========================================================
+# PLATFORM VERIFICATION
+# =========================================================
+
+def verify_platform_presence(dealer_name, platform):
+
+    if platform == "dubizzle":
+
+        queries = [
+            f'"{dealer_name}" site:dubizzle.com.eg',
+            f'"{dealer_name}" dubizzle Egypt',
+        ]
+
+    elif platform == "contactcars":
+
+        queries = [
+            f'"{dealer_name}" site:contactcars.com',
+            f'"{dealer_name}" ContactCars Egypt',
+        ]
+
+    else:
+        return {
+            "exists": False,
+            "results": []
+        }
+
+    all_results = []
+
+    for query in queries:
+
+        results = search_duckduckgo(
+            query,
+            max_results=10
+        )
+
+        all_results.extend(results)
+
+    # Remove duplicate URLs
+
+    unique = {}
+
+    for result in all_results:
+
+        link = result.get("link", "")
+
+        if link:
+            unique[link] = result
+
+    results = list(unique.values())
+
+    if results:
+
+        return {
+            "exists": True,
+            "results": results
+        }
+
+    return {
+        "exists": False,
+        "results": []
+    }
+
+
+# =========================================================
+# MONTHLY ACTIVITY
+# =========================================================
+
+def estimate_monthly_activity(results):
+
+    """
+    لا نخترع رقم.
+
+    لو لم نجد تواريخ فعلية للإعلانات:
+    نرجع "غير متاح".
+
+    لاحقاً سنستبدل هذا الجزء بجامع بيانات متخصص
+    للـ listings والتواريخ.
+    """
+
+    if not results:
+        return "غير متاح"
+
+    return "يحتاج بيانات تواريخ الإعلانات"
+
+
+# =========================================================
+# LEAD SCORING
+# =========================================================
+
+def calculate_score(row):
+
+    score = 0
+
+    if row["الهاتف"]:
+        score += 20
+
+    if row["Dubizzle"] == "نعم":
+        score += 30
+
+    if row["ContactCars"] == "نعم":
+        score += 25
+
+    if row["Dubizzle Ads"] not in [
+        "",
+        "غير متاح",
+        "سيتم التحقق"
+    ]:
+        score += 10
+
+    if row["ContactCars Ads"] not in [
+        "",
+        "غير متاح",
+        "سيتم التحقق"
+    ]:
+        score += 10
+
+    if score > 100:
+        score = 100
+
+    return score
+
+
+# =========================================================
+# WHATSAPP
+# =========================================================
+
+def create_whatsapp_message(row):
+
+    dealer = row["اسم المعرض"]
+
+    message = (
+        f"مساء الخير {dealer} 👋\n\n"
+        "معاك فريق المبيعات، وحابين نتواصل مع حضرتكم "
+        "بخصوص فرصة لزيادة ظهور مخزون السيارات بتاعكم "
+        "والوصول لعملاء مهتمين بالشراء.\n\n"
+        "لو مناسب لحضرتك ممكن نتواصل معاك في الوقت المناسب."
+    )
+
+    return message
+
+
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+
+def run_pipeline(selected_districts, max_results):
+
+    dealers = discover_dealers(
+        selected_districts,
+        max_results
+    )
+
+    if not dealers:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(dealers)
+
+    for index, row in df.iterrows():
+
+        dealer_name = row["اسم المعرض"]
+
+        # -----------------------------------------------
+        # Dubizzle
+        # -----------------------------------------------
+
+        dubizzle = verify_platform_presence(
+            dealer_name,
+            "dubizzle"
+        )
+
+        if dubizzle["exists"]:
+
+            df.at[index, "Dubizzle"] = "نعم"
+
+            df.at[index, "Dubizzle Ads"] = (
+                "تم العثور على نتائج"
+            )
+
+            df.at[index, "Dubizzle Ads / Month"] = (
+                estimate_monthly_activity(
+                    dubizzle["results"]
+                )
+            )
+
         else:
-            st.error(msg)
+
+            df.at[index, "Dubizzle"] = "غير متحقق"
+
+            df.at[index, "Dubizzle Ads"] = "غير متاح"
+
+            df.at[index, "Dubizzle Ads / Month"] = "غير متاح"
+
+        # -----------------------------------------------
+        # ContactCars
+        # -----------------------------------------------
+
+        contactcars = verify_platform_presence(
+            dealer_name,
+            "contactcars"
+        )
+
+        if contactcars["exists"]:
+
+            df.at[index, "ContactCars"] = "نعم"
+
+            df.at[index, "ContactCars Ads"] = (
+                "تم العثور على نتائج"
+            )
+
+            df.at[index, "ContactCars Ads / Month"] = (
+                estimate_monthly_activity(
+                    contactcars["results"]
+                )
+            )
+
+        else:
+
+            df.at[index, "ContactCars"] = "غير متحقق"
+
+            df.at[index, "ContactCars Ads"] = "غير متاح"
+
+            df.at[index, "ContactCars Ads / Month"] = "غير متاح"
+
+    # -----------------------------------------------
+    # Score
+    # -----------------------------------------------
+
+    df["Lead Score"] = df.apply(
+        calculate_score,
+        axis=1
+    )
+
+    # -----------------------------------------------
+    # WhatsApp
+    # -----------------------------------------------
+
+    df["رسالة WhatsApp"] = df.apply(
+        create_whatsapp_message,
+        axis=1
+    )
+
+    df["WhatsApp"] = df.apply(
+        lambda row: whatsapp_link(
+            row["الهاتف"],
+            row["رسالة WhatsApp"]
+        ),
+        axis=1
+    )
+
+    return df
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+with st.sidebar:
+
+    st.header("⚙️ إعدادات البحث")
+
+    selected_districts = st.multiselect(
+        "📍 المناطق",
+        DISTRICT_OPTIONS,
+        default=[
+            "القاهرة - مصر الجديدة والنزهة"
+        ]
+    )
+
+    max_results = st.slider(
+        "🔎 عدد المعارض",
+        min_value=5,
+        max_value=100,
+        value=20,
+        step=5
+    )
+
+    st.divider()
+
+    st.info(
+        "البرنامج لا يفترض وجود بيانات غير متاحة. "
+        "أي معلومة غير مؤكدة تظهر كـ غير متحقق."
+    )
+
+
+# =========================================================
+# BUTTON
+# =========================================================
+
+if st.button(
+    "🚀 ابدأ البحث والتحقق",
+    type="primary",
+    use_container_width=True
+):
+
+    if not selected_districts:
+
+        st.warning(
+            "اختر منطقة واحدة على الأقل."
+        )
+
+    else:
+
+        with st.spinner(
+            "🔎 جاري البحث عن المعارض والتحقق من المصادر..."
+        ):
+
+            df = run_pipeline(
+                selected_districts,
+                max_results
+            )
+
+        if df.empty:
+
+            st.error(
+                "لم يتم العثور على نتائج. "
+                "جرب منطقة أخرى أو عدد نتائج أقل."
+            )
+
+        else:
+
+            st.success(
+                f"✅ تم العثور على {len(df)} معرض."
+            )
+
+            # -----------------------------------------
+            # Dashboard
+            # -----------------------------------------
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            col1.metric(
+                "المعارض",
+                len(df)
+            )
+
+            col2.metric(
+                "Dubizzle",
+                int(
+                    (df["Dubizzle"] == "نعم").sum()
+                )
+            )
+
+            col3.metric(
+                "ContactCars",
+                int(
+                    (df["ContactCars"] == "نعم").sum()
+                )
+            )
+
+            col4.metric(
+                "لديها هاتف",
+                int(
+                    (df["الهاتف"] != "").sum()
+                )
+            )
+
+            st.divider()
+
+            # -----------------------------------------
+            # Table
+            # -----------------------------------------
+
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # -----------------------------------------
+            # Excel
+            # -----------------------------------------
+
+            excel_file = "car_dealer_leads.xlsx"
+
+            df.to_excel(
+                excel_file,
+                index=False
+            )
+
+            with open(
+                excel_file,
+                "rb"
+            ) as file:
+
+                st.download_button(
+                    "📥 تحميل Excel",
+                    data=file,
+                    file_name=excel_file,
+                    mime=(
+                        "application/vnd."
+                        "openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                    use_container_width=True
+                )
