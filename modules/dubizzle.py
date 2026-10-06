@@ -10,7 +10,7 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
 }
 SEARCH_TIMEOUT = 10
 
@@ -43,7 +43,7 @@ def extract_phone(text):
 def _search_web(query):
     url = "https://html.duckduckgo.com/html/?q=" + quote(query)
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        response = requests.get(url, headers=HEADERS, timeout=8)
         if response.status_code != 200:
             return []
         soup = BeautifulSoup(response.text, "html.parser")
@@ -73,10 +73,11 @@ def extract_dealer_name(title, snippet, url):
     return clean if len(clean) > 3 else ""
 
 def verify_all_platforms(dealer_name, district=""):
-    """فحص المنصات باسم المعرض والمنطقة"""
-    clean_dealer = re.sub(r'[^\w\s]', '', dealer_name).strip()
-    search_term = f'"{clean_dealer}" {district}'.strip()
-
+    """فحص المنصات باسم المعرض والمنطقة باستعلام مرن وفعال"""
+    clean_dealer = re.sub(r'[^\w\s]', ' ', dealer_name).strip()
+    # استخراج أول كلمتين أساسيتين من اسم المعرض لضمان دقة البحث
+    core_words = " ".join(clean_dealer.split()[:3])
+    
     status = {
         "facebook": "غير موجود",
         "dubizzle": "غير مشترك",
@@ -85,24 +86,41 @@ def verify_all_platforms(dealer_name, district=""):
         "contactcars_results": "غير موجود"
     }
 
-    fb_results = _search_web(f'site:facebook.com {search_term}')
-    if fb_results:
+    if not core_words or len(core_words) < 3:
+        return status
+
+    # 1. فحص فيسبوك
+    fb_query = f'site:facebook.com "{core_words}" {district}'
+    fb_res = _search_web(fb_query)
+    if fb_res:
         status["facebook"] = "موجود (نشط)"
+    else:
+        # محاولة بحث أوسع
+        if _search_web(f'site:facebook.com {core_words} مصر'):
+            status["facebook"] = "موجود (نشط)"
 
-    dub_results = _search_web(f'site:dubizzle.com.eg {search_term}')
-    if dub_results:
+    time.sleep(0.1)
+
+    # 2. فحص دوبيزل
+    dub_query = f'site:dubizzle.com.eg {core_words}'
+    dub_res = _search_web(dub_query)
+    if dub_res:
         status["dubizzle"] = "مشترك نشط"
-        status["dubizzle_results"] = "إعلانات مسجلة"
+        status["dubizzle_results"] = "إعلانات/متجر مسجل"
 
-    cc_results = _search_web(f'site:contactcars.com {search_term}')
-    if cc_results:
+    time.sleep(0.1)
+
+    # 3. فحص كونتكت كارز
+    cc_query = f'site:contactcars.com {core_words}'
+    cc_res = _search_web(cc_query)
+    if cc_res:
         status["contactcars"] = "موجود"
         status["contactcars_results"] = "إعلانات مسجلة"
 
     return status
 
 # =========================================================
-# DIRECTORY DISCOVERY (كودك الأصلي تماماً مع إضافة الماب)
+# DIRECTORY DISCOVERY
 # =========================================================
 
 def search_directory(url, district, max_results=10):
@@ -115,28 +133,29 @@ def search_directory(url, district, max_results=10):
         results = []
         candidates = []
 
-        for tag in soup.find_all(["h2", "h3", "h4", "a"]):
+        # سحب العناوين المباشرة فقط
+        for tag in soup.find_all(["h2", "h3", "h4"]):
             value = clean_text(tag.get_text(" ", strip=True))
             if value:
                 candidates.append((tag, value))
 
         seen = set()
 
+        # استبعاد عناصر الملاحة والروابط الهيكلية كلياً
+        bad_words = [
+            "map view", "filters", "locations", "letters", "categories", "brands",
+            "car agents", "car showrooms", "car dealerships", "used cars",
+            "new cars dealers", "car dealers", "معارض سيارات", "معارض بيع سيارات",
+            "سيارات مستعملة", "سيارات جديدة", "more info", "phone number", "map",
+            "website", "email us", "whatsapp", "search", "login", "register",
+            "home", "contact us", "privacy", "terms", "facebook", "instagram", "youtube",
+            "الرئيسية", "اتصل بنا", "بحث", "تسجيل الدخول", "عن الشركة", "عرض الخريطة"
+        ]
+
         for tag, name in candidates:
             normalized = normalize_name(name)
 
-            ignored = [
-                "car agents", "car showrooms", "car dealerships", "used cars",
-                "new cars dealers", "car dealers", "معارض سيارات", "معارض بيع سيارات",
-                "سيارات مستعملة", "سيارات جديدة", "more info", "phone number", "map",
-                "website", "email us", "whatsapp",
-            ]
-
-            if normalized in [normalize_name(x) for x in ignored] or len(name) < 3 or len(name) > 100:
-                continue
-
-            bad_parts = ["search", "login", "register", "home", "contact us", "privacy", "terms", "facebook", "instagram", "youtube"]
-            if any(normalize_name(x) in normalized for x in bad_parts):
+            if any(bad in normalized for bad in bad_words) or len(name) < 3 or len(name) > 80:
                 continue
 
             if normalized in seen:
@@ -144,7 +163,7 @@ def search_directory(url, district, max_results=10):
 
             parent = tag.parent
             nearby = clean_text(parent.get_text(" ", strip=True)) if parent else ""
-            if len(nearby) < 30:
+            if len(nearby) < 20:
                 try:
                     nearby = clean_text(tag.parent.parent.get_text(" ", strip=True))
                 except Exception:
@@ -152,21 +171,8 @@ def search_directory(url, district, max_results=10):
 
             combined = f"{name} {nearby}"
 
-            district_normalized = normalize_name(district)
-            combined_normalized = normalize_name(combined)
-
-            if district_normalized not in combined_normalized:
-                english_area = {
-                    "مدينة نصر": "nasr city", "مصر الجديدة": "heliopolis", "التجمع الخامس": "new cairo",
-                    "المعادي": "maadi", "المهندسين": "mohandessin", "الدقي": "dokki", "الهرم": "haram",
-                    "فيصل": "faisal", "الشروق": "shorouk", "العبور": "obour", "الشيخ زايد": "sheikh zayed", "6 أكتوبر": "6 october"
-                }.get(district, "")
-
-                if english_area and normalize_name(english_area) not in combined_normalized:
-                    continue
-
-            car_keywords = ["car", "cars", "motor", "motors", "auto", "automotive", "showroom", "سيارات", "سياره", "سيارة", "معرض", "موتور"]
-            if not any(normalize_name(keyword) in combined_normalized for keyword in car_keywords):
+            car_keywords = ["car", "cars", "motor", "motors", "auto", "automotive", "showroom", "سيارات", "سياره", "سيارة", "معرض", "موتور", "أوتو"]
+            if not any(normalize_name(keyword) in normalize_name(combined) for keyword in car_keywords):
                 continue
 
             phone = extract_mobile_phone(combined)
@@ -223,6 +229,7 @@ def discover_dealers(district, max_results=10):
         all_dealers.extend(results)
         time.sleep(0.3)
 
+    # البحث الاحتياطي في حال عدم كفاية النتائج
     if len(all_dealers) < max_results:
         fallback_queries = [f'"{district}" "معرض سيارات" مصر', f'"{district}" "معارض سيارات" مصر']
         for query in fallback_queries:
@@ -232,7 +239,7 @@ def discover_dealers(district, max_results=10):
                 snippet = result.get("snippet", "")
                 url = result.get("url", "")
 
-                bad_words = ["carfax", "denver", "texas", "california", "florida", "new york", "los angeles"]
+                bad_words = ["carfax", "denver", "texas", "california", "florida", "new york", "los angeles", "filters", "map view"]
                 combined = normalize_name(f"{title} {snippet}")
                 if any(normalize_name(word) in combined for word in bad_words):
                     continue
