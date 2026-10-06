@@ -3,9 +3,9 @@ import pandas as pd
 import os
 import requests
 import urllib.parse
-from bs4 import BeautifulSoup
+import re
 
-st.set_page_config(page_title="Dubizzle Real Lead Prospector", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Dubizzle Lead Prospector", page_icon="🚀", layout="wide")
 
 DISTRICT_OPTIONS = [
     "القاهرة - مدينة نصر",
@@ -18,91 +18,83 @@ DISTRICT_OPTIONS = [
     "الجيزة - 6 أكتوبر والشيخ زايد"
 ]
 
-STREETS_SEARCH = {
-    "مدينة نصر": ["شارع الطيران", "شارع عباس العقاد", "شارع مكرم عبيد", "شارع مصطفى النحاس", "طريق النصر"],
-    "التجمع الخامس والجديدة": ["شارع التسعين الشمالي", "شارع التسعين الجنوبي", "منطقة البنوك التجمع"],
-    "المعادي": ["شارع 9 المعادي", "شارع النصر المعادي", "كورنيش المعادي"],
-    "مصر الجديدة والنزهة": ["شارع الميرغني", "شارع الأهرام مصر الجديدة", "شارع النزهة", "شارع الثورة"],
-    "شبرا ووسط البلد": ["شارع شبرا الرئيسي", "شارع رمسيس", "شارع 26 يوليو"],
-    "المهندسين والدقي": ["شارع جامعة الدول العربية", "شارع البطل أحمد عبد العزيز", "شارع مصدق"],
-    "فيصل والهرم": ["شارع فيصل الرئيسي", "شارع الهرم الرئيسي", "شارع العريش"],
-    "6 أكتوبر والشيخ زايد": ["المحور المركزي 6 أكتوبر", "وصلة دهشور", "شارع البستان الشيخ زايد"]
-}
-
-def fetch_live_google_leads(selected_districts, max_results):
+def fetch_real_leads_ddg(selected_districts, max_results):
     output_file = "car_dealers_leads.xlsx"
     if not selected_districts:
         return None, "⚠️ يرجى اختيار منطقة واحدة على الأقل."
 
-    real_records = []
-    seen_titles = set()
-    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
+    real_records = []
+    seen_titles = set()
+    target_per_district = max(5, int(max_results // len(selected_districts)))
+
     for district in selected_districts:
         main_city = district.split(" - ")[0]
         area_name = district.split(" - ")[-1]
-        
-        search_terms = STREETS_SEARCH.get(area_name, [area_name])
-        
-        for term in search_terms:
-            if len(real_records) >= max_results:
+
+        # استعلامات بحث واقعية ومباشرة
+        queries = [
+            f"معرض سيارات {area_name} {main_city}",
+            f"معارض سيارات في {area_name}",
+            f"أوتو {area_name} سيارات"
+        ]
+
+        district_count = 0
+        for q in queries:
+            if district_count >= target_per_district or len(real_records) >= max_results:
                 break
-                
-            query = f"معرض سيارات {term} {main_city}"
-            url = f"https://www.google.com/search?q={urllib.parse.quote(query)}&tbm=lcl"
 
+            url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
+            
             try:
-                response = requests.get(url, headers=headers, timeout=8)
-                soup = BeautifulSoup(response.text, "html.parser")
-                
-                # كشط الكتل الحقيقية للمعارض من نتائج Google Local
-                containers = soup.find_all("div", class_="VkpO2e") or soup.find_all("div", class_="uE308c")
-                
-                for item in containers:
-                    title_elem = item.find("div", class_="dbg0pd") or item.find("span", class_="OSrJ2e")
-                    phone_elem = item.find("span", class_="LrzI1b") or item.find("div", class_="rllt__details")
-                    
-                    if title_elem:
-                        title = title_elem.text.strip()
-                        if title and title not in seen_titles:
-                            seen_titles.add(title)
-                            
-                            # أخذ رقم التليفون المباشر إن وجد أو صياغة طلب بحث هاتف دقيق
-                            phone_raw = phone_elem.text.strip() if phone_elem else ""
-                            phone = "".join(filter(str.isdigit, phone_raw))
-                            if not phone or len(phone) < 9:
-                                phone = "غير مدون على الخريطة"
+                res = requests.get(url, headers=headers, timeout=10)
+                if res.status_code == 200:
+                    # البحث عن العناوين المباشرة والنصوص
+                    snippets = re.findall(r'<a class="result__url"[^>]*>(.*?)</a>.*?<a class="result__snippet"[^>]*>(.*?)</a>', res.text, re.DOTALL)
+                    titles = re.findall(r'<a class="result__a"[^>]*>(.*?)</a>', res.text, re.DOTALL)
 
-                            maps_link = f"https://www.google.com/maps/search/{urllib.parse.quote(title + ' ' + area_name)}"
-                            address = f"{term}، {area_name}، {main_city}"
-                            
-                            # حساب Lead Score حقيقي بناءً على اكتمال البيانات
-                            score = 85 if phone != "غير مدون على الخريطة" else 60
+                    for idx, raw_title in enumerate(titles):
+                        clean_title = re.sub(r'<[^>]+>', '', raw_title).strip()
+                        clean_title = clean_title.replace("...": "", "").replace("-", " ").strip()
 
-                            real_records.append({
-                                "title": title,
-                                "city": main_city,
-                                "address": address,
-                                "phone": phone,
-                                "link": maps_link,
-                                "has_dubizzle_presence": "يحتاج مراجعة",
-                                "lead_score": f"{score}/100"
-                            })
-                            
-                            if len(real_records) >= max_results:
-                                break
+                        if ("معرض" in clean_title or "سيارات" in clean_title or "أوتو" in clean_title or "Motors" in clean_title):
+                            if clean_title not in seen_titles and len(clean_title) < 60:
+                                seen_titles.add(clean_title)
+
+                                # استخراج أرقام الهواتف إن وجدت في النص المرفق
+                                snippet_text = re.sub(r'<[^>]+>', '', snippets[idx][1]) if idx < len(snippets) else ""
+                                phone_match = re.search(r'(01[0125]\d{8})', snippet_text)
+                                phone = phone_match.group(1) if phone_match else "غير مدون برقم مباشر"
+
+                                maps_url = f"https://www.google.com/maps/search/{urllib.parse.quote(clean_title + ' ' + area_name)}"
+                                address = f"{area_name}، {main_city}"
+
+                                score = 85 if phone != "غير مدون برقم مباشر" else 65
+
+                                real_records.append({
+                                    "title": clean_title,
+                                    "city": main_city,
+                                    "address": address,
+                                    "phone": phone,
+                                    "link": maps_url,
+                                    "has_dubizzle_presence": "يحتاج مراجعة",
+                                    "lead_score": f"{score}/100"
+                                })
+                                district_count += 1
+                                if district_count >= target_per_district or len(real_records) >= max_results:
+                                    break
             except Exception:
                 continue
 
     if not real_records:
-        return None, "❌ تعذر جلب نتائج حية حالياً من جوجل، يرجى إعادة المحاولة بعد لحظات."
+        return None, "❌ تعذر جلب البيانات حالياً، يرجى المحاولة مرة أخرى."
 
     final_df = pd.DataFrame(real_records)
     final_df.to_excel(output_file, index=False)
-    return final_df, f"✅ تم جلب {len(final_df)} معرض حقيقي ومباشر بنجاح!"
+    return final_df, f"✅ تم استخراج {len(final_df)} معرض حقيقي ومباشر بنجاح!"
 
 def run_outreach_direct(msg_type):
     leads_file = "car_dealers_leads.xlsx"
@@ -131,7 +123,7 @@ def run_outreach_direct(msg_type):
             
         encoded_msg = urllib.parse.quote(msg)
         
-        if phone != "غير مدون على الخريطة" and len(phone) >= 10:
+        if phone.startswith("01") and len(phone) == 11:
             wa_link = f"https://wa.me/2{phone}?text={encoded_msg}"
         else:
             wa_link = "يتطلب مراجعة الرقم"
@@ -152,8 +144,8 @@ def run_outreach_direct(msg_type):
     return campaign_df, f"✅ تم تجهيز حملة الواتساب بنجاح! عدد المعارض: {len(campaign_df)}"
 
 # --- Streamlit UI ---
-st.title("🚀 Dubizzle Live Lead Prospector (Real Data)")
-st.markdown("استخراج حقيقي ومباشر للمعارض الموجودة حالياً على Google Maps.")
+st.title("🚀 Dubizzle Lead Prospector")
+st.markdown("استخراج المعارض الحقيقية مباشرة وتجهيز حملة التواصل عبر الواتساب.")
 
 col1, col2 = st.columns(2)
 
@@ -163,7 +155,7 @@ with col1:
         options=DISTRICT_OPTIONS, 
         default=["القاهرة - مصر الجديدة والنزهة"]
     )
-    max_results_input = st.number_input("العدد المطلوب", min_value=5, max_value=200, value=30, step=5)
+    max_results_input = st.number_input("العدد المطلوب", min_value=5, max_value=200, value=20, step=5)
 
 with col2:
     msg_style_input = st.radio(
@@ -175,14 +167,14 @@ with col2:
 col_btn1, col_btn2 = st.columns(2)
 
 with col_btn1:
-    btn_prospect = st.button("🚀 1. ابدأ السحب المباشر (Live Scrape)", use_container_width=True)
+    btn_prospect = st.button("🚀 1. ابدأ الجمع الحقيقي (Start Prospecting)", use_container_width=True)
 
 with col_btn2:
     btn_outreach = st.button("💬 2. تجهيز حملة الواتساب", use_container_width=True)
 
 if btn_prospect:
-    with st.spinner("جاري التواصل مع محرك الخرائط وجلب البيانات الحية..."):
-        df, msg = fetch_live_google_leads(cities_input, max_results_input)
+    with st.spinner("جاري السحب الحقيقي لجلب المعارض..."):
+        df, msg = fetch_real_leads_ddg(cities_input, max_results_input)
         if df is not None:
             st.success(msg)
             st.dataframe(df)
