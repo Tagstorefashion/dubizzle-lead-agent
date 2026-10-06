@@ -35,7 +35,6 @@ def fetch_real_leads_ddg(selected_districts, max_results):
         main_city = district.split(" - ")[0]
         area_name = district.split(" - ")[-1]
 
-        # استعلامات بحث واقعية ومباشرة
         queries = [
             f"معرض سيارات {area_name} {main_city}",
             f"معارض سيارات في {area_name}",
@@ -52,19 +51,17 @@ def fetch_real_leads_ddg(selected_districts, max_results):
             try:
                 res = requests.get(url, headers=headers, timeout=10)
                 if res.status_code == 200:
-                    # البحث عن العناوين المباشرة والنصوص
                     snippets = re.findall(r'<a class="result__url"[^>]*>(.*?)</a>.*?<a class="result__snippet"[^>]*>(.*?)</a>', res.text, re.DOTALL)
                     titles = re.findall(r'<a class="result__a"[^>]*>(.*?)</a>', res.text, re.DOTALL)
 
                     for idx, raw_title in enumerate(titles):
                         clean_title = re.sub(r'<[^>]+>', '', raw_title).strip()
-                        clean_title = clean_title.replace("...": "", "").replace("-", " ").strip()
+                        clean_title = clean_title.replace("...", "").replace("-", " ").strip()
 
                         if ("معرض" in clean_title or "سيارات" in clean_title or "أوتو" in clean_title or "Motors" in clean_title):
                             if clean_title not in seen_titles and len(clean_title) < 60:
                                 seen_titles.add(clean_title)
 
-                                # استخراج أرقام الهواتف إن وجدت في النص المرفق
                                 snippet_text = re.sub(r'<[^>]+>', '', snippets[idx][1]) if idx < len(snippets) else ""
                                 phone_match = re.search(r'(01[0125]\d{8})', snippet_text)
                                 phone = phone_match.group(1) if phone_match else "غير مدون برقم مباشر"
