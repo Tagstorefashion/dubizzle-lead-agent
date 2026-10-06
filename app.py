@@ -1633,4 +1633,17 @@ if "dealer_results" in st.session_state:
         st.download_button(
             "📊 تحميل Excel",
             data=excel_buffer.getvalue(),
-            file_name="egy
+            file_name="egypt_car_dealers.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            ),
+            use_container_width=True
+        )
+
+    except Exception as e:
+
+        st.warning(
+            f"تعذر إنشاء ملف Excel: {e}"
+        )
+```
