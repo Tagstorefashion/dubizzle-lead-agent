@@ -1,27 +1,31 @@
-import re
-import time
-import urllib.parse
-import io
-
+```python
+import streamlit as st
 import pandas as pd
 import requests
-import streamlit as st
 from bs4 import BeautifulSoup
+import re
+import time
+from urllib.parse import quote, urljoin
 
 from modules.dubizzle import get_dubizzle_status
 from modules.contactcars import get_contactcars_status
-from modules.deduplication import remove_duplicate_dealers
+from modules.deduplication import remove_duplicates
 
 
 # =========================================================
-# CONFIG
+# PAGE CONFIG
 # =========================================================
 
 st.set_page_config(
     page_title="Egypt Car Dealer Lead Intelligence",
     page_icon="🚗",
-    layout="wide",
+    layout="wide"
 )
+
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 HEADERS = {
     "User-Agent": (
@@ -29,888 +33,1003 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/154.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
 }
 
-SEARCH_TIMEOUT = 8
-
-
-# =========================================================
-# AREAS
-# =========================================================
+SEARCH_TIMEOUT = 10
 
 DISTRICTS = [
     "مدينة نصر",
     "مصر الجديدة",
-    "التجمع الخامس",
-    "التجمع الأول",
-    "التجمع الثالث",
     "المعادي",
-    "زهراء المعادي",
-    "المقطم",
+    "التجمع الخامس",
+    "الهرم",
+    "فيصل",
     "6 أكتوبر",
     "الشيخ زايد",
     "المهندسين",
     "الدقي",
-    "العجوزة",
-    "الهرم",
-    "فيصل",
-    "شبرا",
     "وسط البلد",
     "العبور",
     "الشروق",
-    "مدينتي",
-    "العاشر من رمضان",
 ]
 
 
 # =========================================================
-# TEXT
+# GENERAL HELPERS
 # =========================================================
 
 def clean_text(value):
-    if not value:
+    if value is None:
         return ""
 
-    text = BeautifulSoup(
-        str(value),
-        "html.parser"
-    ).get_text(" ")
+    value = str(value)
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"\s+", " ", value)
 
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
+    return value.strip()
 
 
 def normalize_name(name):
-    if not name:
-        return ""
-
     name = clean_text(name).lower()
 
-    replacements = {
-        "أ": "ا",
-        "إ": "ا",
-        "آ": "ا",
-        "ة": "ه",
-        "ى": "ي",
-    }
+    replacements = [
+        "cars",
+        "car",
+        "auto",
+        "automotive",
+        "motors",
+        "motor",
+        "showroom",
+        "showrooms",
+        "للسيارات",
+        "للسيارات",
+        "سيارات",
+        "معرض",
+        "معارض",
+        "شركة",
+        "شركه",
+    ]
 
-    for old, new in replacements.items():
-        name = name.replace(old, new)
+    for word in replacements:
+        name = name.replace(word, " ")
 
-    name = re.sub(
-        r"[^\w\s\u0600-\u06FF]",
-        " ",
-        name
-    )
-
-    name = re.sub(
-        r"\s+",
-        " ",
-        name
-    )
+    name = re.sub(r"[^a-zA-Z0-9\u0600-\u06FF]+", " ", name)
+    name = re.sub(r"\s+", " ", name)
 
     return name.strip()
 
 
-# =========================================================
-# PHONE
-# =========================================================
-
 def extract_phone(text):
-
     if not text:
         return ""
 
     text = str(text)
 
     patterns = [
-        r"01[0125]\d{8}",
+        r"(?:\+20|0020)[\s\-()]?1[0125]\d[\s\-]?\d{3}[\s\-]?\d{4}",
         r"01[0125][\s\-]?\d{3}[\s\-]?\d{4}",
-        r"\+20[\s\-]?1[0125][\s\-]?\d{8}",
-        r"0020[\s\-]?1[0125][\s\-]?\d{8}",
+        r"\+20[\s\-]?(?:2|0?2)[\s\-]?\d{7,8}",
+        r"0?2[\s\-]?\d{7,8}",
     ]
 
     for pattern in patterns:
+        match = re.search(pattern, text)
 
-        match = re.search(
-            pattern,
-            text
-        )
+        if match:
+            phone = match.group(0)
+            phone = re.sub(r"[^\d+]", "", phone)
 
-        if not match:
-            continue
+            if phone.startswith("0020"):
+                phone = "+" + phone[2:]
 
-        phone = re.sub(
-            r"\D",
-            "",
-            match.group()
-        )
+            if phone.startswith("01"):
+                phone = "+20" + phone[1:]
 
-        if phone.startswith("0020"):
-            phone = phone[2:]
-
-        if phone.startswith("20"):
-            phone = phone[2:]
-
-        if len(phone) == 11 and phone.startswith("01"):
             return phone
 
     return ""
 
 
-# =========================================================
-# LINKS
-# =========================================================
+def extract_all_phones(text):
+    if not text:
+        return []
 
-def google_maps_link(name, district):
+    phones = []
 
-    query = urllib.parse.quote(
-        f"{name} {district} Egypt"
-    )
+    patterns = [
+        r"(?:\+20|0020)[\s\-()]?1[0125]\d[\s\-]?\d{3}[\s\-]?\d{4}",
+        r"01[0125][\s\-]?\d{3}[\s\-]?\d{4}",
+        r"\+20[\s\-]?(?:2|0?2)[\s\-]?\d{7,8}",
+        r"0?2[\s\-]?\d{7,8}",
+    ]
 
-    return (
-        "https://www.google.com/maps/search/?api=1&query="
-        + query
-    )
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+
+        for match in matches:
+            phone = re.sub(r"[^\d+]", "", match)
+
+            if phone.startswith("0020"):
+                phone = "+" + phone[2:]
+
+            if phone.startswith("01"):
+                phone = "+20" + phone[1:]
+
+            if phone not in phones:
+                phones.append(phone)
+
+    return phones
 
 
-def whatsapp_link(phone, message):
+def google_maps_link(name, address=""):
+    query = f"{name} {address} Egypt"
+    return "https://www.google.com/maps/search/?api=1&query=" + quote(query)
 
+
+def whatsapp_link(phone):
     if not phone:
         return ""
 
-    phone = re.sub(
-        r"\D",
-        "",
-        str(phone)
-    )
+    phone = re.sub(r"\D", "", phone)
 
     if phone.startswith("0"):
         phone = "20" + phone[1:]
 
-    return (
-        "https://wa.me/"
-        + phone
-        + "?text="
-        + urllib.parse.quote(message)
-    )
+    if not phone.startswith("20"):
+        phone = "20" + phone
+
+    return f"https://wa.me/{phone}"
 
 
 # =========================================================
-# SEARCH ENGINE
+# SEARCH ENGINES
 # =========================================================
 
-def search_duckduckgo(
-    query,
-    max_results=10
-):
+def search_duckduckgo(query, max_results=10):
+    results = []
 
     try:
-
-        url = (
-            "https://html.duckduckgo.com/html/?q="
-            + urllib.parse.quote(query)
-        )
+        url = "https://html.duckduckgo.com/html/"
 
         response = requests.get(
             url,
+            params={"q": query},
             headers=HEADERS,
-            timeout=SEARCH_TIMEOUT
+            timeout=SEARCH_TIMEOUT,
         )
 
         if response.status_code != 200:
             return []
 
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
+        soup = BeautifulSoup(response.text, "html.parser")
 
-        results = []
+        for result in soup.select(".result")[:max_results]:
+            title_el = result.select_one(".result__a")
+            snippet_el = result.select_one(".result__snippet")
 
-        for result in soup.select(".result"):
-
-            title_element = result.select_one(
-                ".result__title"
-            )
-
-            link_element = result.select_one(
-                ".result__a"
-            )
-
-            snippet_element = result.select_one(
-                ".result__snippet"
-            )
-
-            if not title_element or not link_element:
+            if not title_el:
                 continue
 
-            title = clean_text(
-                title_element.get_text(
-                    " ",
-                    strip=True
-                )
+            title = clean_text(title_el.get_text(" ", strip=True))
+            link = title_el.get("href", "")
+            snippet = clean_text(
+                snippet_el.get_text(" ", strip=True)
+                if snippet_el
+                else ""
             )
 
-            url = link_element.get(
-                "href",
-                ""
-            )
-
-            snippet = ""
-
-            if snippet_element:
-                snippet = clean_text(
-                    snippet_element.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-
-            if title and url:
-
+            if title and link:
                 results.append({
                     "title": title,
-                    "url": url,
+                    "url": link,
                     "snippet": snippet,
                 })
 
-            if len(results) >= max_results:
-                break
-
-        return results
-
     except Exception:
-        return []
+        pass
+
+    return results
 
 
-def search_bing(
-    query,
-    max_results=10
-):
+def search_bing(query, max_results=10):
+    results = []
 
     try:
-
-        url = (
-            "https://www.bing.com/search?q="
-            + urllib.parse.quote(query)
-        )
+        url = "https://www.bing.com/search"
 
         response = requests.get(
             url,
+            params={"q": query},
             headers=HEADERS,
-            timeout=SEARCH_TIMEOUT
+            timeout=SEARCH_TIMEOUT,
         )
 
         if response.status_code != 200:
             return []
 
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
+        soup = BeautifulSoup(response.text, "html.parser")
 
-        results = []
+        for result in soup.select("li.b_algo")[:max_results]:
+            title_el = result.select_one("h2 a")
+            snippet_el = result.select_one(".b_caption p")
 
-        for result in soup.select(
-            "li.b_algo"
-        ):
-
-            title_element = result.select_one(
-                "h2 a"
-            )
-
-            if not title_element:
+            if not title_el:
                 continue
 
-            title = clean_text(
-                title_element.get_text(
-                    " ",
-                    strip=True
-                )
+            title = clean_text(title_el.get_text(" ", strip=True))
+            link = title_el.get("href", "")
+            snippet = clean_text(
+                snippet_el.get_text(" ", strip=True)
+                if snippet_el
+                else ""
             )
 
-            url = title_element.get(
-                "href",
-                ""
-            )
-
-            snippet_element = result.select_one(
-                ".b_caption p"
-            )
-
-            snippet = ""
-
-            if snippet_element:
-                snippet = clean_text(
-                    snippet_element.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-
-            if title and url:
-
+            if title and link:
                 results.append({
                     "title": title,
-                    "url": url,
+                    "url": link,
                     "snippet": snippet,
                 })
 
-            if len(results) >= max_results:
-                break
-
-        return results
-
     except Exception:
-        return []
+        pass
+
+    return results
 
 
-def search_web(
-    query,
-    max_results=10
-):
-
-    results = search_duckduckgo(
-        query,
-        max_results
-    )
+def search_web(query, max_results=10):
+    results = search_duckduckgo(query, max_results)
 
     if results:
         return results
 
-    return search_bing(
-        query,
-        max_results
-    )
+    return search_bing(query, max_results)
 
 
 # =========================================================
-# VALIDATION
+# DIRECTORY DISCOVERY
 # =========================================================
 
-EGYPT_WORDS = [
-    "مصر",
-    "القاهرة",
-    "الجيزة",
-    "مدينة نصر",
-    "مصر الجديدة",
-    "التجمع",
-    "المعادي",
-    "المقطم",
-    "المهندسين",
-    "الدقي",
-    "العجوزة",
-    "الهرم",
-    "فيصل",
-    "شبرا",
-    "العبور",
-    "الشروق",
-    "مدينتي",
-    "زايد",
-    "أكتوبر",
-    "egypt",
-    "cairo",
-    "giza",
-]
+GENERIC_NAMES = {
+    "more info",
+    "see all branches",
+    "map",
+    "photos",
+    "videos",
+    "search",
+    "home",
+    "next",
+    "previous",
+    "read more",
+}
 
 
-CAR_WORDS = [
-    "سيارات",
-    "سياره",
-    "سيارة",
-    "معرض",
-    "معارض",
-    "تاجر",
-    "تجار",
-    "كار",
-    "cars",
+CAR_KEYWORDS = [
     "car",
-    "dealer",
-    "dealers",
-    "motors",
-    "motor",
+    "cars",
     "auto",
     "automotive",
-    "showroom",
+    "motor",
+    "motors",
+    "vehicle",
+    "vehicles",
+    "سيارات",
+    "سياره",
+    "سيارات",
+    "أوتو",
+    "موتور",
+    "للسيارات",
 ]
 
 
-BAD_WORDS = [
-    "carfax",
-    "denver",
-    "texas",
-    "california",
-    "florida",
-    "new york",
-    "los angeles",
-    "used cars for sale",
-    "cars for sale",
-    "wikipedia",
-    "pinterest",
-    "amazon",
-    "ebay",
-]
+def is_car_name(name):
+    name_lower = name.lower()
+
+    for keyword in CAR_KEYWORDS:
+        if keyword.lower() in name_lower:
+            return True
+
+    return True
 
 
-def is_egyptian_result(
-    title,
-    snippet,
-    district
-):
+def find_detail_links(soup, base_url):
+    links = []
 
-    text = normalize_name(
-        f"{title} {snippet}"
-    )
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        text = clean_text(a.get_text(" ", strip=True))
 
-    # ممنوع نتائج أجنبية واضحة
-    for bad in BAD_WORDS:
+        if not href:
+            continue
 
-        if normalize_name(bad) in text:
-            return False
+        full_url = urljoin(base_url, href)
 
-    # لازم يكون فيه نشاط سيارات
-    has_car_word = any(
-        normalize_name(word) in text
-        for word in CAR_WORDS
-    )
+        if (
+            "company.aspx" in full_url.lower()
+            or "/company/" in full_url.lower()
+            or "more-info" in full_url.lower()
+        ):
+            links.append({
+                "text": text,
+                "url": full_url,
+            })
 
-    if not has_car_word:
-        return False
-
-    # لازم يكون فيه إشارة لمصر/القاهرة
-    has_egypt_word = any(
-        normalize_name(word) in text
-        for word in EGYPT_WORDS
-    )
-
-    # أو يكون اسم المنطقة نفسه ظاهر
-    district_normalized = normalize_name(
-        district
-    )
-
-    if district_normalized in text:
-        has_egypt_word = True
-
-    return has_egypt_word
+    return links
 
 
-# =========================================================
-# EXTRACT REAL DEALER NAME
-# =========================================================
+def parse_directory_page(url, district):
+    dealers = []
 
-def extract_dealer_name(
-    title,
-    snippet="",
-    source_url=""
-):
-
-    title = clean_text(title)
-    snippet = clean_text(snippet)
-
-    if not title:
-        return ""
-
-    name = title
-
-    # Facebook / Instagram / Google suffixes
-    suffixes = [
-        r"\s*[-|]\s*Facebook.*$",
-        r"\s*[-|]\s*Instagram.*$",
-        r"\s*[-|]\s*Google.*$",
-        r"\s*[-|]\s*YouTube.*$",
-        r"\s*[-|]\s*Dubizzle.*$",
-        r"\s*[-|]\s*ContactCars.*$",
-    ]
-
-    for pattern in suffixes:
-
-        name = re.sub(
-            pattern,
-            "",
-            name,
-            flags=re.IGNORECASE
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=SEARCH_TIMEOUT,
         )
 
-    name = clean_text(name)
+        if response.status_code != 200:
+            return []
 
-    # أسماء عامة لا تعتبر معرض
-    generic_names = [
-        "معرض سيارات",
-        "معارض سيارات",
-        "سيارات للبيع",
-        "سيارات مستعملة",
-        "سيارات جديدة",
-        "used cars",
-        "used cars for sale",
-        "cars for sale",
-        "car dealer",
-        "car dealers",
-        "car dealership",
-        "cars showroom",
-        "dealership",
-        "dubizzle",
-        "contactcars",
-        "facebook",
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        detail_links = find_detail_links(soup, url)
+
+        # -------------------------------------------------
+        # 1. Try extracting actual company cards
+        # -------------------------------------------------
+
+        possible_cards = soup.select(
+            ".company-listing, "
+            ".listing, "
+            ".result, "
+            ".company, "
+            ".business, "
+            "article"
+        )
+
+        for card in possible_cards:
+            text = clean_text(card.get_text(" ", strip=True))
+
+            if not text:
+                continue
+
+            phone = extract_phone(text)
+
+            links = card.find_all("a", href=True)
+
+            company_name = ""
+
+            detail_url = ""
+
+            for a in links:
+                anchor_text = clean_text(
+                    a.get_text(" ", strip=True)
+                )
+
+                href = urljoin(url, a.get("href", ""))
+
+                if not anchor_text:
+                    continue
+
+                if anchor_text.lower() in GENERIC_NAMES:
+                    continue
+
+                if len(anchor_text) < 3:
+                    continue
+
+                if len(anchor_text) > 100:
+                    continue
+
+                if (
+                    "company.aspx" in href.lower()
+                    or "/company/" in href.lower()
+                ):
+                    company_name = anchor_text
+                    detail_url = href
+                    break
+
+            if not company_name:
+                continue
+
+            dealers.append({
+                "name": company_name,
+                "district": district,
+                "address": text[:500],
+                "phone": phone,
+                "source": url,
+                "detail_url": detail_url,
+            })
+
+        # -------------------------------------------------
+        # 2. Fallback: parse headings
+        # -------------------------------------------------
+
+        headings = soup.find_all(
+            ["h2", "h3", "h4"]
+        )
+
+        for heading in headings:
+            name = clean_text(
+                heading.get_text(" ", strip=True)
+            )
+
+            if not name:
+                continue
+
+            if name.lower() in GENERIC_NAMES:
+                continue
+
+            if len(name) < 3:
+                continue
+
+            if len(name) > 100:
+                continue
+
+            parent = heading.parent
+
+            nearby_text = ""
+
+            if parent:
+                nearby_text = clean_text(
+                    parent.get_text(" ", strip=True)
+                )
+
+            # Expand one level when necessary
+            if len(nearby_text) < 50 and parent:
+                grandparent = parent.parent
+
+                if grandparent:
+                    nearby_text = clean_text(
+                        grandparent.get_text(" ", strip=True)
+                    )
+
+            phone = extract_phone(nearby_text)
+
+            detail_url = ""
+
+            for a in heading.find_all_next(
+                "a",
+                href=True,
+                limit=5
+            ):
+                href = urljoin(
+                    url,
+                    a.get("href", "")
+                )
+
+                if (
+                    "company.aspx" in href.lower()
+                    or "/company/" in href.lower()
+                ):
+                    detail_url = href
+                    break
+
+            dealers.append({
+                "name": name,
+                "district": district,
+                "address": nearby_text[:500],
+                "phone": phone,
+                "source": url,
+                "detail_url": detail_url,
+            })
+
+    except Exception:
+        return []
+
+    return dealers
+
+
+# =========================================================
+# DETAIL PAGE ENRICHMENT
+# =========================================================
+
+def enrich_from_detail_page(dealer):
+    detail_url = dealer.get("detail_url", "")
+
+    if not detail_url:
+        return dealer
+
+    try:
+        response = requests.get(
+            detail_url,
+            headers=HEADERS,
+            timeout=SEARCH_TIMEOUT,
+        )
+
+        if response.status_code != 200:
+            return dealer
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        page_text = clean_text(
+            soup.get_text(" ", strip=True)
+        )
+
+        # -------------------------------------------------
+        # Phone
+        # -------------------------------------------------
+
+        phones = extract_all_phones(page_text)
+
+        if phones:
+            dealer["phone"] = phones[0]
+
+            if len(phones) > 1:
+                dealer["phones"] = " | ".join(phones)
+
+        # -------------------------------------------------
+        # Email
+        # -------------------------------------------------
+
+        emails = re.findall(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            page_text
+        )
+
+        if emails:
+            dealer["email"] = emails[0]
+
+        # -------------------------------------------------
+        # Website / Facebook
+        # -------------------------------------------------
+
+        facebook = ""
+        website = ""
+
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+
+            if not href:
+                continue
+
+            lower = href.lower()
+
+            if "facebook.com" in lower and not facebook:
+                facebook = href
+
+            elif (
+                href.startswith("http")
+                and "140online.com" not in lower
+                and "yellowpages.com.eg" not in lower
+                and not website
+            ):
+                website = href
+
+        if facebook:
+            dealer["facebook"] = facebook
+
+        if website:
+            dealer["website"] = website
+
+        # -------------------------------------------------
+        # Better address
+        # -------------------------------------------------
+
+        district_words = [
+            "Nasr City",
+            "Misr El Gedeida",
+            "Heliopolis",
+            "Maadi",
+            "Cairo",
+            "مدينة نصر",
+            "مصر الجديدة",
+            "المعادي",
+            "القاهرة",
+        ]
+
+        address_candidates = []
+
+        for line in soup.stripped_strings:
+            line = clean_text(line)
+
+            if len(line) < 15:
+                continue
+
+            if any(
+                word.lower() in line.lower()
+                for word in district_words
+            ):
+                address_candidates.append(line)
+
+        if address_candidates:
+            dealer["address"] = address_candidates[0]
+
+    except Exception:
+        pass
+
+    return dealer
+
+
+# =========================================================
+# DIRECTORY URLS
+# =========================================================
+
+DIRECTORY_URLS = {
+    "مدينة نصر": [
+        "https://www.140online.com/Classes.aspx?"
+        "Area=375&AreaName=Nasr+City&ClassId=140&Gov=2"
+        "&GovName=Cairo&Lang=En",
+
+        "https://www.140online.com/UsedCars.aspx",
+
+        "https://yellowpages.com.eg/en/category/"
+        "nasr-city-car-dealerships/3256",
+
+        "https://yellowpages.com.eg/en/category/"
+        "مدينة-نصر-سيارات-جديدة-وكلاء-حصريون/3256",
+    ],
+
+    "مصر الجديدة": [
+        "https://yellowpages.com.eg/en/category/"
+        "heliopolis-car-dealerships/3256",
+    ],
+
+    "المعادي": [
+        "https://yellowpages.com.eg/en/category/"
+        "maadi-car-dealerships/3256",
+    ],
+}
+
+
+# =========================================================
+# SEARCH FALLBACK
+# =========================================================
+
+def fallback_discovery(district, limit):
+    dealers = []
+
+    queries = [
+        f"car showroom {district} Cairo Egypt",
+        f"car dealer {district} Cairo Egypt",
+        f"used cars showroom {district} Cairo",
+        f"معارض سيارات {district}",
+        f"معرض سيارات {district}",
     ]
 
-    normalized = normalize_name(
-        name
+    for query in queries:
+        results = search_web(
+            query,
+            max_results=10
+        )
+
+        for result in results:
+            title = clean_text(result.get("title", ""))
+            snippet = clean_text(result.get("snippet", ""))
+            url = result.get("url", "")
+
+            combined = f"{title} {snippet}"
+
+            if not any(
+                word.lower() in combined.lower()
+                for word in CAR_KEYWORDS
+            ):
+                continue
+
+            phone = extract_phone(combined)
+
+            dealers.append({
+                "name": title,
+                "district": district,
+                "address": snippet,
+                "phone": phone,
+                "source": url,
+                "detail_url": "",
+            })
+
+            if len(dealers) >= limit:
+                return dealers
+
+        time.sleep(0.3)
+
+    return dealers
+
+
+# =========================================================
+# MAIN DISCOVERY
+# =========================================================
+
+def discover_dealers(district, limit=10):
+    dealers = []
+
+    urls = DIRECTORY_URLS.get(
+        district,
+        []
     )
 
-    for generic in generic_names:
+    # -----------------------------------------------------
+    # Primary: Egyptian directories
+    # -----------------------------------------------------
 
-        if normalized == normalize_name(
-            generic
-        ):
-            return ""
+    for url in urls:
+        if len(dealers) >= limit * 2:
+            break
 
-    # عناوين CARFAX وأشباهها
-    bad_name_parts = [
-        "carfax",
-        "cars for sale in",
-        "used cars for sale in",
-        "new cars for sale in",
-        "wikipedia",
-    ]
+        found = parse_directory_page(
+            url,
+            district
+        )
 
-    for bad in bad_name_parts:
+        dealers.extend(found)
 
-        if normalize_name(bad) in normalized:
-            return ""
+        time.sleep(0.3)
 
-    # لا نقبل عنوانًا طويلًا جدًا
-    if len(name) > 100:
-        return ""
+    # -----------------------------------------------------
+    # Fallback search
+    # -----------------------------------------------------
 
-    return name
+    if len(dealers) < 3:
+        fallback = fallback_discovery(
+            district,
+            limit * 2
+        )
+
+        dealers.extend(fallback)
+
+    # -----------------------------------------------------
+    # Normalize / deduplicate
+    # -----------------------------------------------------
+
+    unique = {}
+
+    for dealer in dealers:
+        name = clean_text(
+            dealer.get("name", "")
+        )
+
+        if not name:
+            continue
+
+        normalized = normalize_name(name)
+
+        if len(normalized) < 2:
+            continue
+
+        if normalized not in unique:
+            dealer["name"] = name
+            unique[normalized] = dealer
+        else:
+            existing = unique[normalized]
+
+            # Keep better phone
+            if (
+                not existing.get("phone")
+                and dealer.get("phone")
+            ):
+                existing["phone"] = dealer["phone"]
+
+            # Keep detail URL
+            if (
+                not existing.get("detail_url")
+                and dealer.get("detail_url")
+            ):
+                existing["detail_url"] = dealer[
+                    "detail_url"
+                ]
+
+    dealers = list(unique.values())
+
+    # -----------------------------------------------------
+    # Enrich details
+    # -----------------------------------------------------
+
+    enriched = []
+
+    progress = st.progress(
+        0,
+        text="جاري جلب بيانات المعارض..."
+    )
+
+    total = min(
+        len(dealers),
+        limit
+    )
+
+    for index, dealer in enumerate(
+        dealers[:limit]
+    ):
+        dealer = enrich_from_detail_page(
+            dealer
+        )
+
+        enriched.append(dealer)
+
+        progress.progress(
+            (index + 1) / max(total, 1),
+            text=(
+                f"جاري تجهيز المعرض "
+                f"{index + 1} من {total}"
+            )
+        )
+
+        time.sleep(0.15)
+
+    progress.empty()
+
+    return enriched
 
 
 # =========================================================
 # FACEBOOK SEARCH
 # =========================================================
 
-def search_facebook(
-    dealer_name,
-    district
-):
-
+def search_facebook(dealer_name, district):
     queries = [
         f'"{dealer_name}" Facebook Egypt',
         f'"{dealer_name}" "{district}" Facebook',
     ]
 
     for query in queries:
-
         results = search_web(
             query,
             max_results=5
         )
 
         for result in results:
+            url = result.get("url", "")
+            title = clean_text(
+                result.get("title", "")
+            )
+            snippet = clean_text(
+                result.get("snippet", "")
+            )
 
-            url = result.get(
-                "url",
-                ""
+            combined = (
+                f"{title} {snippet} {url}"
             ).lower()
 
-            title = result.get(
-                "title",
-                ""
-            )
+            if "facebook.com" in combined:
+                return url
 
-            snippet = result.get(
-                "snippet",
-                ""
-            )
-
-            if (
-                "facebook.com" in url
-                or "facebook" in title.lower()
-                or "facebook" in snippet.lower()
-            ):
-
-                return {
-                    "url": result.get(
-                        "url",
-                        ""
-                    ),
-                    "phone": extract_phone(
-                        f"{title} {snippet}"
-                    ),
-                }
-
-    return {
-        "url": "",
-        "phone": "",
-    }
-
-
-# =========================================================
-# DISCOVERY
-# =========================================================
-
-def discover_dealers(
-    district,
-    max_results
-):
-
-    dealers = []
-    seen_names = set()
-
-    # عدد قليل من البحثات حتى يكون سريع
-    queries = [
-
-        f'"معرض سيارات" "{district}" مصر',
-
-        f'"معارض سيارات" "{district}"',
-
-        f'"car dealer" "{district}" Egypt',
-
-    ]
-
-    for query in queries:
-
-        results = search_web(
-            query,
-            max_results=10
-        )
-
-        time.sleep(0.3)
-
-        for result in results:
-
-            title = result.get(
-                "title",
-                ""
-            )
-
-            snippet = result.get(
-                "snippet",
-                ""
-            )
-
-            url = result.get(
-                "url",
-                ""
-            )
-
-            # ---------------------------------------------
-            # MUST LOOK EGYPTIAN
-            # ---------------------------------------------
-
-            if not is_egyptian_result(
-                title,
-                snippet,
-                district
-            ):
-                continue
-
-            # ---------------------------------------------
-            # EXTRACT NAME
-            # ---------------------------------------------
-
-            dealer_name = extract_dealer_name(
-                title,
-                snippet,
-                url
-            )
-
-            if not dealer_name:
-                continue
-
-            normalized = normalize_name(
-                dealer_name
-            )
-
-            if not normalized:
-                continue
-
-            if normalized in seen_names:
-                continue
-
-            # ---------------------------------------------
-            # PHONE
-            # ---------------------------------------------
-
-            phone = extract_phone(
-                f"{title} {snippet}"
-            )
-
-            # ---------------------------------------------
-            # FACEBOOK
-            # ---------------------------------------------
-
-            facebook = search_facebook(
-                dealer_name,
-                district
-            )
-
-            if not phone:
-                phone = facebook.get(
-                    "phone",
-                    ""
-                )
-
-            # ---------------------------------------------
-            # ADD
-            # ---------------------------------------------
-
-            seen_names.add(
-                normalized
-            )
-
-            dealers.append({
-                "اسم المعرض": dealer_name,
-                "المنطقة": district,
-                "الهاتف": phone,
-                "Facebook": facebook.get(
-                    "url",
-                    ""
-                ),
-                "مصدر الاكتشاف": url,
-                "وصف المصدر": snippet,
-            })
-
-            if len(dealers) >= max_results:
-                return dealers
-
-    return dealers
+    return ""
 
 
 # =========================================================
 # PLATFORM VERIFICATION
 # =========================================================
 
-def verify_dealer(
-    dealer_name
-):
+def verify_dealer(dealer):
+    name = dealer.get("name", "")
+    district = dealer.get("district", "")
 
-    result = {
-        "Dubizzle": "غير متحقق",
-        "Dubizzle Results": 0,
-        "Dubizzle URL": "",
-
-        "ContactCars": "غير متحقق",
-        "ContactCars Results": 0,
-        "ContactCars URL": "",
-    }
+    # -----------------------------------------------------
+    # Dubizzle
+    # -----------------------------------------------------
 
     try:
-
         dubizzle = get_dubizzle_status(
-            dealer_name
+            name,
+            district
         )
-
-        result["Dubizzle"] = dubizzle.get(
-            "status",
-            "غير متحقق"
-        )
-
-        result["Dubizzle Results"] = dubizzle.get(
-            "listing_count",
-            0
-        )
-
-        result["Dubizzle URL"] = dubizzle.get(
-            "url",
-            ""
-        )
-
     except Exception:
-        pass
+        dubizzle = {
+            "status": "غير متاح",
+            "listing_count": 0,
+            "url": "",
+        }
+
+    # -----------------------------------------------------
+    # ContactCars
+    # -----------------------------------------------------
 
     try:
-
         contactcars = get_contactcars_status(
-            dealer_name
+            name,
+            district
         )
-
-        result["ContactCars"] = contactcars.get(
-            "status",
-            "غير متحقق"
-        )
-
-        result["ContactCars Results"] = contactcars.get(
-            "listing_count",
-            0
-        )
-
-        result["ContactCars URL"] = contactcars.get(
-            "url",
-            ""
-        )
-
     except Exception:
-        pass
+        contactcars = {
+            "status": "غير متاح",
+            "listing_count": 0,
+            "url": "",
+        }
 
-    return result
+    # -----------------------------------------------------
+    # Facebook
+    # -----------------------------------------------------
+
+    facebook = dealer.get(
+        "facebook",
+        ""
+    )
+
+    if not facebook:
+        facebook = search_facebook(
+            name,
+            district
+        )
+
+    dealer["facebook"] = facebook
+
+    dealer["dubizzle_status"] = dubizzle.get(
+        "status",
+        "غير متاح"
+    )
+
+    dealer["dubizzle_results"] = dubizzle.get(
+        "listing_count",
+        0
+    )
+
+    dealer["dubizzle_url"] = dubizzle.get(
+        "url",
+        ""
+    )
+
+    dealer["contactcars_status"] = contactcars.get(
+        "status",
+        "غير متاح"
+    )
+
+    dealer["contactcars_results"] = contactcars.get(
+        "listing_count",
+        0
+    )
+
+    dealer["contactcars_url"] = contactcars.get(
+        "url",
+        ""
+    )
+
+    return dealer
 
 
 # =========================================================
-# SCORE
+# SCORING
 # =========================================================
 
-def calculate_score(row):
-
+def calculate_score(dealer):
     score = 0
 
-    if row.get("الهاتف"):
+    if dealer.get("phone"):
         score += 25
 
-    if row.get("Facebook"):
+    if dealer.get("facebook"):
         score += 15
 
-    if row.get("Dubizzle") == "نعم":
-        score += 20
-
-    if row.get("ContactCars") == "نعم":
-        score += 20
-
-    if row.get("المنطقة"):
+    if dealer.get("website"):
         score += 10
 
-    if row.get("مصدر الاكتشاف"):
+    if dealer.get("address"):
         score += 10
 
-    return min(
-        score,
-        100
-    )
+    if dealer.get("dubizzle_status") == "موجود":
+        score += 20
+
+    if dealer.get("contactcars_status") == "موجود":
+        score += 20
+
+    return min(score, 100)
 
 
 def score_label(score):
-
     if score >= 80:
-        return "🔥 Hot Lead"
+        return "🔥 قوي"
 
     if score >= 60:
-        return "🟢 Good Lead"
+        return "🟢 جيد"
 
     if score >= 40:
-        return "🟡 Medium"
+        return "🟡 متوسط"
 
-    return "⚪ Weak"
+    return "🔴 ضعيف"
 
 
 # =========================================================
 # WHATSAPP
 # =========================================================
 
-def create_whatsapp_message(
-    dealer_name
-):
+def create_whatsapp_message(dealer):
+    name = dealer.get("name", "")
 
     return (
-        f"السلام عليكم، مع حضرتك من فريق متخصص "
-        f"في حلول التسويق وإدارة العملاء لمعارض السيارات.\n\n"
-        f"لاحظنا نشاط {dealer_name} في سوق السيارات، "
-        f"وحابين نتواصل مع حضرتك بخصوص فرصة تساعد "
-        f"المعرض في زيادة العملاء المحتملين وتحسين "
-        f"متابعة الـ leads.\n\n"
-        f"لو مناسب، ممكن نتواصل مع حضرتك في الوقت المناسب؟"
+        f"أهلاً {name} 👋\n\n"
+        "معاكم خدمة متخصصة في التسويق الرقمي "
+        "لمعارض السيارات.\n\n"
+        "بنساعد المعرض في زيادة الـ leads "
+        "والعملاء المحتملين من خلال WhatsApp "
+        "والمنصات الرقمية.\n\n"
+        "حابين نبعث لحضرتك تفاصيل سريعة؟"
     )
 
 
@@ -918,153 +1037,154 @@ def create_whatsapp_message(
 # PIPELINE
 # =========================================================
 
-def run_pipeline(
-    district,
-    max_results
-):
+def run_pipeline(district, limit):
+    st.info(
+        f"🔎 جاري البحث عن معارض حقيقية في {district}..."
+    )
 
     dealers = discover_dealers(
         district,
-        max_results
+        limit
     )
 
     if not dealers:
-        return pd.DataFrame()
+        return []
 
-    progress = st.progress(0)
+    st.success(
+        f"تم العثور على {len(dealers)} معرض مبدئي."
+    )
 
-    processed = []
+    # -----------------------------------------------------
+    # Verification progress
+    # -----------------------------------------------------
+
+    verified = []
+
+    progress = st.progress(
+        0,
+        text="جاري التحقق من المنصات..."
+    )
 
     total = len(dealers)
 
-    for index, dealer in enumerate(
-        dealers
-    ):
+    for index, dealer in enumerate(dealers):
 
-        verification = verify_dealer(
-            dealer["اسم المعرض"]
-        )
-
-        dealer.update(
-            verification
-        )
-
-        dealer[
-            "الإعلانات الشهرية"
-        ] = "غير متاح"
-
-        message = create_whatsapp_message(
-            dealer["اسم المعرض"]
-        )
-
-        dealer[
-            "رسالة واتساب"
-        ] = message
-
-        dealer[
-            "Google Maps"
-        ] = google_maps_link(
-            dealer["اسم المعرض"],
-            district
-        )
-
-        dealer[
-            "WhatsApp"
-        ] = whatsapp_link(
-            dealer.get(
-                "الهاتف",
-                ""
-            ),
-            message
-        )
-
-        dealer[
-            "Score"
-        ] = calculate_score(
+        dealer = verify_dealer(
             dealer
         )
 
-        dealer[
-            "Lead Quality"
-        ] = score_label(
-            dealer["Score"]
-        )
-
-        processed.append(
+        dealer["score"] = calculate_score(
             dealer
         )
+
+        dealer["score_label"] = score_label(
+            dealer["score"]
+        )
+
+        dealer["maps_url"] = google_maps_link(
+            dealer.get("name", ""),
+            dealer.get("address", "")
+        )
+
+        dealer["whatsapp_url"] = whatsapp_link(
+            dealer.get("phone", "")
+        )
+
+        dealer["whatsapp_message"] = (
+            create_whatsapp_message(
+                dealer
+            )
+        )
+
+        verified.append(dealer)
 
         progress.progress(
-            (index + 1) / total
+            (index + 1) / max(total, 1),
+            text=(
+                f"التحقق من "
+                f"{index + 1} من {total}"
+            )
         )
 
-    try:
+    progress.empty()
 
-        processed = remove_duplicate_dealers(
-            processed
-        )
-
-    except Exception:
-        pass
-
-    return pd.DataFrame(
-        processed
-    )
+    return verified
 
 
 # =========================================================
-# UI
+# SIDEBAR
+# =========================================================
+
+st.sidebar.title("🚗 Lead Prospector")
+
+district = st.sidebar.selectbox(
+    "المنطقة",
+    DISTRICTS
+)
+
+limit = st.sidebar.slider(
+    "عدد النتائج",
+    min_value=5,
+    max_value=30,
+    value=10,
+    step=5
+)
+
+run_search = st.sidebar.button(
+    "🔎 ابدأ البحث",
+    use_container_width=True
+)
+
+st.sidebar.markdown("---")
+
+st.sidebar.caption(
+    "المصادر الأساسية:\n"
+    "• 140online\n"
+    "• Egypt Yellow Pages\n"
+    "• Dubizzle\n"
+    "• ContactCars\n"
+    "• Facebook"
+)
+
+
+# =========================================================
+# HEADER
 # =========================================================
 
 st.title(
     "🚗 Egypt Car Dealer Lead Intelligence"
 )
 
-st.markdown(
-    "اكتشاف معارض السيارات المصرية والتحقق من بياناتها."
+st.write(
+    "اكتشاف معارض السيارات المصرية "
+    "ثم إثراء بياناتها والتحقق من وجودها "
+    "على المنصات المختلفة."
 )
 
-with st.sidebar:
-
-    st.header(
-        "⚙️ Search Settings"
-    )
-
-    district = st.selectbox(
-        "اختر المنطقة",
-        DISTRICTS
-    )
-
-    max_results = st.slider(
-        "عدد المعارض",
-        5,
-        20,
-        10
-    )
-
-    st.caption(
-        "النسخة الحالية تركز على جودة الاكتشاف "
-        "قبل زيادة عدد النتائج."
-    )
+st.warning(
+    "⚠️ ملاحظة: أرقام Results الخاصة بـ Dubizzle "
+    "وContactCars في النسخة الحالية هي نتائج بحث "
+    "وليست بالضرورة العدد الحقيقي للإعلانات. "
+    "سنفصل حساب الـ listing count الحقيقي في خطوة لاحقة."
+)
 
 
-if st.sidebar.button(
-    "🚀 Start Lead Discovery",
-    use_container_width=True
-):
+# =========================================================
+# RUN
+# =========================================================
+
+if run_search:
 
     with st.spinner(
-        f"🔎 جاري البحث عن معارض حقيقية في {district}..."
+        "جاري تشغيل البحث..."
     ):
-
-        df = run_pipeline(
+        results = run_pipeline(
             district,
-            max_results
+            limit
         )
 
-    if df.empty:
-
-        st.warning(
+    if not results:
+        st.error(
             "لم يتم العثور على معارض موثوقة. "
             "جرب منطقة أخرى."
         )
@@ -1073,256 +1193,444 @@ if st.sidebar.button(
 
         st.session_state[
             "dealer_results"
-        ] = df
-
-        st.success(
-            f"✅ تم العثور على {len(df)} معرض."
-        )
+        ] = results
 
 
 # =========================================================
-# RESULTS
+# DISPLAY
 # =========================================================
 
 if "dealer_results" in st.session_state:
 
-    df = st.session_state[
+    results = st.session_state[
         "dealer_results"
     ]
 
     st.subheader(
-        "📊 Dealer Leads"
+        f"📊 النتائج — {len(results)} معرض"
     )
 
-    c1, c2, c3, c4 = st.columns(4)
+    # -----------------------------------------------------
+    # Summary
+    # -----------------------------------------------------
 
-    c1.metric(
-        "المعارض",
-        len(df)
+    col1, col2, col3, col4 = st.columns(4)
+
+    phones_count = sum(
+        bool(x.get("phone"))
+        for x in results
     )
 
-    c2.metric(
-        "Hot Leads",
-        int(
-            (
-                df["Lead Quality"]
-                == "🔥 Hot Lead"
-            ).sum()
-        )
+    facebook_count = sum(
+        bool(x.get("facebook"))
+        for x in results
     )
 
-    c3.metric(
-        "معها هاتف",
-        int(
-            df["الهاتف"]
-            .fillna("")
-            .astype(str)
-            .ne("")
-            .sum()
-        )
+    dubizzle_count = sum(
+        x.get("dubizzle_status") == "موجود"
+        for x in results
     )
 
-    c4.metric(
-        "Facebook",
-        int(
-            df["Facebook"]
-            .fillna("")
-            .astype(str)
-            .ne("")
-            .sum()
-        )
+    contactcars_count = sum(
+        x.get("contactcars_status") == "موجود"
+        for x in results
     )
 
-    st.divider()
+    col1.metric(
+        "📞 أرقام",
+        phones_count
+    )
+
+    col2.metric(
+        "📘 Facebook",
+        facebook_count
+    )
+
+    col3.metric(
+        "🟣 Dubizzle",
+        dubizzle_count
+    )
+
+    col4.metric(
+        "🔵 ContactCars",
+        contactcars_count
+    )
+
+    st.markdown("---")
+
+    # -----------------------------------------------------
+    # Table
+    # -----------------------------------------------------
+
+    table_data = []
+
+    for dealer in results:
+
+        table_data.append({
+            "المعرض": dealer.get(
+                "name",
+                ""
+            ),
+
+            "المنطقة": dealer.get(
+                "district",
+                ""
+            ),
+
+            "الموبايل": dealer.get(
+                "phone",
+                ""
+            ),
+
+            "Facebook": (
+                "موجود"
+                if dealer.get("facebook")
+                else "غير موجود"
+            ),
+
+            "Dubizzle": dealer.get(
+                "dubizzle_status",
+                "غير متاح"
+            ),
+
+            "Dubizzle Results": dealer.get(
+                "dubizzle_results",
+                0
+            ),
+
+            "ContactCars": dealer.get(
+                "contactcars_status",
+                "غير متاح"
+            ),
+
+            "ContactCars Results": dealer.get(
+                "contactcars_results",
+                0
+            ),
+
+            "Score": dealer.get(
+                "score",
+                0
+            ),
+
+            "التقييم": dealer.get(
+                "score_label",
+                ""
+            ),
+        })
+
+    df = pd.DataFrame(
+        table_data
+    )
 
     st.dataframe(
-        df[
-            [
-                "اسم المعرض",
-                "المنطقة",
-                "الهاتف",
-                "Facebook",
-                "Dubizzle",
-                "ContactCars",
-                "Score",
-                "Lead Quality",
-            ]
-        ],
+        df,
         use_container_width=True,
         hide_index=True
     )
 
-    # =====================================================
-    # DETAILS
-    # =====================================================
+    # -----------------------------------------------------
+    # Details
+    # -----------------------------------------------------
+
+    st.markdown("---")
 
     st.subheader(
-        "📌 Lead Details"
+        "🔍 تفاصيل المعارض"
     )
 
-    selected = st.selectbox(
-        "اختر معرض",
-        df["اسم المعرض"].tolist()
-    )
+    for index, dealer in enumerate(results):
 
-    row = df[
-        df["اسم المعرض"]
-        == selected
-    ].iloc[0]
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-
-        st.markdown(
-            f"### 🏢 {row['اسم المعرض']}"
+        name = dealer.get(
+            "name",
+            "معرض"
         )
 
-        st.write(
-            f"📍 المنطقة: {row['المنطقة']}"
+        score = dealer.get(
+            "score",
+            0
         )
 
-        st.write(
-            f"📞 الهاتف: "
-            f"{row['الهاتف'] or 'غير متاح'}"
-        )
+        with st.expander(
+            f"{score_label(score)} — {name}"
+        ):
 
-        st.write(
-            f"⭐ Score: {row['Score']}"
-        )
+            col1, col2 = st.columns(2)
 
-        st.write(
-            f"🎯 {row['Lead Quality']}"
-        )
+            with col1:
 
-    with c2:
+                st.write(
+                    "**📍 المنطقة:**",
+                    dealer.get(
+                        "district",
+                        ""
+                    )
+                )
 
-        st.markdown(
-            "### 🌐 Verification"
-        )
+                st.write(
+                    "**🏠 العنوان:**",
+                    dealer.get(
+                        "address",
+                        ""
+                    )
+                )
 
-        st.write(
-            f"Dubizzle: {row['Dubizzle']}"
-        )
+                st.write(
+                    "**📞 الموبايل:**",
+                    dealer.get(
+                        "phone",
+                        "غير متوفر"
+                    )
+                )
 
-        st.write(
-            f"ContactCars: {row['ContactCars']}"
-        )
+                if dealer.get("phones"):
+                    st.write(
+                        "**📞 أرقام إضافية:**",
+                        dealer.get("phones")
+                    )
 
-    st.markdown(
-        "### 🔗 Sources"
-    )
+                st.write(
+                    "**📧 Email:**",
+                    dealer.get(
+                        "email",
+                        "غير متوفر"
+                    )
+                )
 
-    l1, l2, l3 = st.columns(3)
+            with col2:
 
-    with l1:
+                st.write(
+                    "**📘 Facebook:**",
+                    dealer.get(
+                        "facebook",
+                        "غير متوفر"
+                    )
+                )
 
-        if row.get("Facebook"):
+                st.write(
+                    "**🌐 Website:**",
+                    dealer.get(
+                        "website",
+                        "غير متوفر"
+                    )
+                )
 
-            st.link_button(
-                "📘 Facebook",
-                row["Facebook"],
-                use_container_width=True
+                st.write(
+                    "**🟣 Dubizzle:**",
+                    dealer.get(
+                        "dubizzle_status",
+                        "غير متاح"
+                    )
+                )
+
+                st.write(
+                    "**🔵 ContactCars:**",
+                    dealer.get(
+                        "contactcars_status",
+                        "غير متاح"
+                    )
+                )
+
+                st.write(
+                    "**⭐ Score:**",
+                    f"{score}/100"
+                )
+
+            st.markdown("---")
+
+            links = []
+
+            if dealer.get("whatsapp_url"):
+                links.append(
+                    f"[💬 WhatsApp]("
+                    f"{dealer['whatsapp_url']})"
+                )
+
+            if dealer.get("facebook"):
+                links.append(
+                    f"[📘 Facebook]("
+                    f"{dealer['facebook']})"
+                )
+
+            if dealer.get("maps_url"):
+                links.append(
+                    f"[📍 Google Maps]("
+                    f"{dealer['maps_url']})"
+                )
+
+            if dealer.get("dubizzle_url"):
+                links.append(
+                    f"[🟣 Dubizzle]("
+                    f"{dealer['dubizzle_url']})"
+                )
+
+            if dealer.get("contactcars_url"):
+                links.append(
+                    f"[🔵 ContactCars]("
+                    f"{dealer['contactcars_url']})"
+                )
+
+            if links:
+                st.markdown(
+                    " | ".join(links)
+                )
+
+            st.markdown(
+                "**💬 رسالة WhatsApp جاهزة:**"
             )
 
-    with l2:
-
-        if row.get("Google Maps"):
-
-            st.link_button(
-                "📍 Google Maps",
-                row["Google Maps"],
-                use_container_width=True
+            st.code(
+                dealer.get(
+                    "whatsapp_message",
+                    ""
+                ),
+                language=None
             )
 
-    with l3:
 
-        if row.get("WhatsApp"):
-
-            st.link_button(
-                "💬 WhatsApp",
-                row["WhatsApp"],
-                use_container_width=True
-            )
-
-    st.markdown(
-        "### 💬 WhatsApp Message"
-    )
-
-    st.text_area(
-        "الرسالة",
-        value=row.get(
-            "رسالة واتساب",
-            ""
-        ),
-        height=160
-    )
-
-    # =====================================================
+    # -----------------------------------------------------
     # EXPORT
-    # =====================================================
+    # -----------------------------------------------------
 
-    st.divider()
+    st.markdown("---")
 
     st.subheader(
-        "📥 Export"
+        "📥 تصدير البيانات"
     )
 
-    csv_data = df.to_csv(
-        index=False,
-        encoding="utf-8-sig"
+    export_rows = []
+
+    for dealer in results:
+
+        export_rows.append({
+            "Dealer Name": dealer.get(
+                "name",
+                ""
+            ),
+
+            "District": dealer.get(
+                "district",
+                ""
+            ),
+
+            "Address": dealer.get(
+                "address",
+                ""
+            ),
+
+            "Phone": dealer.get(
+                "phone",
+                ""
+            ),
+
+            "Additional Phones": dealer.get(
+                "phones",
+                ""
+            ),
+
+            "Email": dealer.get(
+                "email",
+                ""
+            ),
+
+            "Facebook": dealer.get(
+                "facebook",
+                ""
+            ),
+
+            "Website": dealer.get(
+                "website",
+                ""
+            ),
+
+            "Dubizzle Status": dealer.get(
+                "dubizzle_status",
+                ""
+            ),
+
+            "Dubizzle Search Results": dealer.get(
+                "dubizzle_results",
+                0
+            ),
+
+            "ContactCars Status": dealer.get(
+                "contactcars_status",
+                ""
+            ),
+
+            "ContactCars Search Results": dealer.get(
+                "contactcars_results",
+                0
+            ),
+
+            "Score": dealer.get(
+                "score",
+                0
+            ),
+
+            "Google Maps": dealer.get(
+                "maps_url",
+                ""
+            ),
+
+            "WhatsApp": dealer.get(
+                "whatsapp_url",
+                ""
+            ),
+
+            "WhatsApp Message": dealer.get(
+                "whatsapp_message",
+                ""
+            ),
+
+            "Source": dealer.get(
+                "source",
+                ""
+            ),
+
+            "Detail Page": dealer.get(
+                "detail_url",
+                ""
+            ),
+        })
+
+    export_df = pd.DataFrame(
+        export_rows
     )
+
+    csv_data = export_df.to_csv(
+        index=False
+    ).encode("utf-8-sig")
 
     st.download_button(
-        "⬇️ Download CSV",
+        "📄 تحميل CSV",
         data=csv_data,
-        file_name="egypt_car_dealer_leads.csv",
+        file_name="egypt_car_dealers.csv",
         mime="text/csv",
         use_container_width=True
     )
 
-    try:
+    # -----------------------------------------------------
+    # Excel
+    # -----------------------------------------------------
 
-        buffer = io.BytesIO()
+    try:
+        import io
+
+        excel_buffer = io.BytesIO()
 
         with pd.ExcelWriter(
-            buffer,
+            excel_buffer,
             engine="openpyxl"
         ) as writer:
 
-            df.to_excel(
+            export_df.to_excel(
                 writer,
                 index=False,
-                sheet_name="Dealer Leads"
+                sheet_name="Dealers"
             )
 
-        buffer.seek(0)
-
         st.download_button(
-            "📊 Download Excel",
-            data=buffer,
-            file_name="egypt_car_dealer_leads.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-"
-                "officedocument.spreadsheetml.sheet"
-            ),
-            use_container_width=True
-        )
-
-    except Exception as e:
-
-        st.error(
-            f"Excel Error: {e}"
-        )
-
-
-# =========================================================
-# FOOTER
-# =========================================================
-
-st.divider()
-
-st.caption(
-    "Egypt Car Dealer Lead Intelligence • "
-    "Egyptian Dealer Discovery + Verification"
-)
+            "📊 تحميل Excel",
+            data=excel_buffer.getvalue(),
+            file_name="egy
