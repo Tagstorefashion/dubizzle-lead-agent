@@ -1,8 +1,10 @@
-import gradio as gr
+import streamlit as st
 import pandas as pd
 import os
 import random
 import urllib.parse
+
+st.set_page_config(page_title="Dubizzle Lead Prospector", page_icon="🚀", layout="wide")
 
 DISTRICT_OPTIONS = [
     "القاهرة - مدينة نصر",
@@ -15,7 +17,6 @@ DISTRICT_OPTIONS = [
     "الجيزة - 6 أكتوبر والشيخ زايد"
 ]
 
-# شوارع ومعالم حقيقية لتوليد عناوين تفصيلية متنوعة
 STREETS_MAP = {
     "مدينة نصر": ["شارع الطيران", "شارع عباس العقاد", "شارع مكرم عبيد", "شارع مصطفى النحاس", "طريق النصر"],
     "التجمع الخامس والجديدة": ["شارع التسعين الشمالي", "شارع التسعين الجنوبي", "محور محمد بن زايد", "منطقة البنوك"],
@@ -40,23 +41,18 @@ NAMES = [
 SUFFIXES = ["للسيارات", "أوتوموتيف", "موتورز", "أوتو", "للتجارة والاستيراد", "كارز"]
 
 def generate_unique_dealer_name(area_name, seen_base_names):
-    """توليد اسم معرض فريد مع منع تكرار اسم العلامة التجارية التجاري"""
     for _ in range(500):
         p = random.choice(PREFIXES)
         n = random.choice(NAMES)
         s = random.choice(SUFFIXES)
-        
-        # التأكد من عدم تكرار الاسم التجاري الأساسي
         base_identifier = f"{p}_{n}_{s}"
         if base_identifier not in seen_base_names:
             seen_base_names.add(base_identifier)
             return f"{p} {n} {s} - {area_name}"
-            
     random_num = random.randint(100, 9999)
     return f"معرض النجم الساطع {random_num} - {area_name}"
 
 def generate_realistic_address(city, area_name):
-    """توليد عنوان تفصيلي متغير وواقعي لكل معرض"""
     streets = STREETS_MAP.get(area_name, ["الشارع الرئيسي", "طريق النصر", "الشارع التجارى"])
     selected_street = random.choice(streets)
     building_num = random.randint(5, 120)
@@ -68,24 +64,19 @@ def clean_text(text):
     return str(text).strip()
 
 def calculate_lead_score(has_dubizzle, fb_ads_count, contact_ads_count):
-    """حساب تقييم الجاهزية المالي والإعلاني للعميل بسقف أقصى 100/100"""
     score = 40
     if has_dubizzle == "لا":
         score += 25
     else:
         score += 10
-        
     score += min(fb_ads_count * 3, 15)
     score += min(contact_ads_count * 2, 20)
-    
-    # ضمان ألا تتجاوز النتيجة 100
-    final_score = min(score, 100)
-    return final_score
+    return min(score, 100)
 
 def run_prospector_direct(selected_districts, max_results):
     output_file = "car_dealers_leads.xlsx"
     if not selected_districts:
-        return "⚠️ يرجى اختيار منطقة واحدة على الأقل من القائمة."
+        return None, "⚠️ يرجى اختيار منطقة واحدة على الأقل من القائمة."
 
     if os.path.exists(output_file):
         try:
@@ -108,14 +99,11 @@ def run_prospector_direct(selected_districts, max_results):
 
         if phone not in seen_phones:
             seen_phones.add(phone)
-            
             maps_url = f"https://www.google.com/maps/search/{urllib.parse.quote(dealer_title)}"
             fb_ads_num = random.randint(2, 8)
-            
             has_contact = random.choice(["نعم", "نعم", "لا"])
             contact_ads_num = random.randint(3, 12) if has_contact == "نعم" else 0
             contact_str = f"{contact_ads_num} إعلانات تمويل نشطة/شهرياً" if contact_ads_num > 0 else "غير نشط على كونتكت"
-
             has_dub = random.choice(["نعم", "لا"])
             lead_score = calculate_lead_score(has_dub, fb_ads_num, contact_ads_num)
             detailed_address = generate_realistic_address(main_city, area_name)
@@ -134,22 +122,20 @@ def run_prospector_direct(selected_districts, max_results):
 
     final_df = pd.DataFrame(new_records)
     final_df.to_excel(output_file, index=False)
-    
-    return f"✅ تم استخراج البيانات بنجاح بدون أي تكرار وبتقييم منضبط! إجمالي المعارض: {len(final_df)} معرض."
+    return final_df, f"✅ تم استخراج البيانات بنجاح! إجمالي المعارض: {len(final_df)} معرض."
 
 def run_outreach_direct(msg_type):
     leads_file = "car_dealers_leads.xlsx"
     campaign_file = "ready_whatsapp_campaign.xlsx"
     
     if not os.path.exists(leads_file):
-        return "❌ لم يتم العثور على ملف البيانات، يرجى تشغيل الجمع أولاً.", None, None
+        return None, "❌ لم يتم العثور على ملف البيانات، يرجى تشغيل الجمع أولاً."
 
     df = pd.read_excel(leads_file)
     if df.empty:
-        return "❌ ملف البيانات فارغ، يرجى تشغيل الجمع أولاً.", None, None
+        return None, "❌ ملف البيانات فارغ، يرجى تشغيل الجمع أولاً."
 
     campaign_data = []
-
     for _, row in df.iterrows():
         title = clean_text(row.get("title", ""))
         phone = clean_text(row.get("phone", ""))
@@ -192,46 +178,59 @@ def run_outreach_direct(msg_type):
     campaign_df = pd.DataFrame(campaign_data)
     campaign_df.sort_values(by="تقييم الجاهزية (Lead Score)", ascending=False, inplace=True)
     campaign_df.to_excel(campaign_file, index=False)
-    
-    return f"✅ تم تجهيز الحملة بنجاح! عدد المعارض المؤهلة: {len(campaign_df)}", campaign_df, campaign_file
+    return campaign_df, f"✅ تم تجهيز الحملة بنجاح! عدد المعارض المؤهلة: {len(campaign_df)}"
 
-with gr.Blocks(title="Dubizzle Lead Prospector & Outreach Pro") as demo:
-    gr.Markdown("# 🚀 Dubizzle Lead Prospector & Qualification Agent")
-    gr.Markdown("اختر المناطق ونوع الحملة لاستخراج البيانات، تقييم جاهزية العملاء، وتأهيلهم للتواصل عبر الواتساب.")
-    
-    with gr.Row():
-        cities_input = gr.Dropdown(
-            choices=DISTRICT_OPTIONS, 
-            value=["القاهرة - مصر الجديدة والنزهة"], 
-            multiselect=True, 
-            label="📌 اختر المناطق المطلوبة"
-        )
-        max_results_input = gr.Number(label="العدد المطلوب", value=500)
-        msg_style_input = gr.Radio(
-            choices=["ترويجي مباشر (Promotional)", "عروض رسمية (Formal Offer)"], 
-            value="ترويجي مباشر (Promotional)", 
-            label="🎯 نبرة رسالة الواتساب"
-        )
-    
-    with gr.Row():
-        btn_prospect = gr.Button("🚀 1. ابدأ الجمع والتقييم (Prospector & Score)", variant="primary")
-        btn_outreach = gr.Button("💬 2. تجهيز حملة الواتساب المؤهلة", variant="secondary")
-        
-    status_output = gr.Textbox(label="حالة التشغيل وقاعدة البيانات", interactive=False)
-    table_output = gr.Dataframe(label="📊 نتائج الحملة وترتيب المعارض حسب درجة الجاهزية (Lead Score)")
-    file_download = gr.File(label="📥 تحميل ملف الإكسيل الكامل")
-    
-    btn_prospect.click(
-        fn=run_prospector_direct, 
-        inputs=[cities_input, max_results_input], 
-        outputs=status_output
+# --- Streamlit UI ---
+st.title("🚀 Dubizzle Lead Prospector & Qualification Agent")
+st.markdown("اختر المناطق ونوع الحملة لاستخراج البيانات، تقييم جاهزية العملاء، وتأهيلهم للتواصل عبر الواتساب.")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    cities_input = st.multiselect(
+        "📌 اختر المناطق المطلوبة", 
+        options=DISTRICT_OPTIONS, 
+        default=["القاهرة - مصر الجديدة والنزهة"]
     )
-    
-    btn_outreach.click(
-        fn=run_outreach_direct, 
-        inputs=[msg_style_input], 
-        outputs=[status_output, table_output, file_download]
+    max_results_input = st.number_input("العدد المطلوب", min_value=10, max_value=2000, value=500, step=50)
+
+with col2:
+    msg_style_input = st.radio(
+        "🎯 نبرة رسالة الواتساب", 
+        options=["ترويجي مباشر (Promotional)", "عروض رسمية (Formal Offer)"], 
+        index=0
     )
 
-if __name__ == "__main__":
-    demo.launch()
+col_btn1, col_btn2 = st.columns(2)
+
+with col_btn1:
+    btn_prospect = st.button("🚀 1. ابدأ الجمع والتقييم (Prospector & Score)", use_container_width=True)
+
+with col_btn2:
+    btn_outreach = st.button("💬 2. تجهيز حملة الواتساب المؤهلة", use_container_width=True)
+
+if btn_prospect:
+    with st.spinner("جاري استخراج البيانات وتقييم العملاء..."):
+        df, msg = run_prospector_direct(cities_input, max_results_input)
+        if df is not None:
+            st.success(msg)
+            st.dataframe(df)
+        else:
+            st.warning(msg)
+
+if btn_outreach:
+    with st.spinner("جاري إعداد الرسائل وتجهيز الشيت..."):
+        df_out, msg = run_outreach_direct(msg_style_input)
+        if df_out is not None:
+            st.success(msg)
+            st.dataframe(df_out)
+            
+            with open("ready_whatsapp_campaign.xlsx", "rb") as file:
+                st.download_button(
+                    label="📥 تحميل ملف الإكسيل الكامل للواتساب",
+                    data=file,
+                    file_name="ready_whatsapp_campaign.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+        else:
+            st.error(msg)
