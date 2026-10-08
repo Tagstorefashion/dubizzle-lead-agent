@@ -85,19 +85,28 @@ def _is_name_match(core, text):
     return fuzz.partial_ratio(core, _arnorm(text)) >= 90
 
 
+_MOBILE_RE = re.compile(
+    r"(?<!\d)(?:\+?20|0020|0)?[\s\-\.]?(1[0125])((?:[\s\-\.]?\d){8})(?!\d)"
+)
+_LANDLINE_RE = re.compile(
+    r"(?<!\d)(?:\+?20|0020|0)[\s\-\.]?([2-9](?:[\s\-\.]?\d){7,8})(?!\d)"
+)
+
+
 def extract_mobile_phone(text):
-    """يطلّع رقم موبايل مصري (010/011/012/015)، وإلا رقم أرضي، وإلا 'غير متاح'."""
+    """يطلّع رقم موبايل مصري (010/011/012/015)، وإلا رقم أرضي، وإلا 'غير متاح'.
+    بيقرأ النص زي ما هو (من غير ما يلزق الأرقام ببعض)، فالعنوان اللي جنب الرقم مايبوّظوش."""
     if not text:
         return "غير متاح"
-    t = clean_digits(text)
+    t = str(text).translate(AR_DIGITS)
 
-    m = re.search(r"(?<!\d)(?:\+20|0020|20|0)?(1[0125]\d{8})(?!\d)", t)
+    m = _MOBILE_RE.search(t)
     if m:
-        return "0" + m.group(1)
+        return "0" + m.group(1) + re.sub(r"\D", "", m.group(2))
 
-    m = re.search(r"(?<!\d)(?:\+20|0)([2-9]\d{7,8})(?!\d)", t)
+    m = _LANDLINE_RE.search(t)
     if m:
-        return "0" + m.group(1)
+        return "0" + re.sub(r"\D", "", m.group(1))
 
     return "غير متاح"
 
@@ -114,10 +123,15 @@ def is_mobile_number(value):
 # البحث: Serper (لو فيه مفتاح) أو DuckDuckGo (احتياطي)
 # =========================================================
 
+# عدّاد طلبات Serper (كل طلب = credit واحد تقريباً). التطبيق بيصفّره في أول كل عملية.
+USAGE = {"serper_calls": 0}
+
+
 def _serper(endpoint, payload):
     key = _key()
     if not key:
         return None
+    USAGE["serper_calls"] += 1
     try:
         r = requests.post(
             endpoint,
