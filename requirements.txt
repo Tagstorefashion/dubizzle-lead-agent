@@ -1,7 +1,6 @@
 streamlit
 pandas
-requests
 openpyxl
+requests
 beautifulsoup4
 rapidfuzz
-lxml
