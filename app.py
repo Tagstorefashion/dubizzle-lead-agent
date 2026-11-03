@@ -141,22 +141,42 @@ def best_phone(dealer):
 
 
 def estimate_credits(n, verify):
-    return round(n * 3.3) + 2 if verify else round(n * 0.3) + 2
+    return round(n * 4) + 6 if verify else round(n * 0.5) + 6
 
 
-def run_prospector(district, max_results, verify, on_progress):
+def dealer_keys(phone, fb_url):
+    """مفاتيح تميّز المعرض: موبايله أو صفحة فيسبوك بتاعته (عشان نكشف التكرار)."""
+    keys = []
+    if dz.is_mobile_number(phone):
+        keys.append("tel:" + dz.clean_digits(phone))
+    if fb_url:
+        keys.append("fb:" + fb_url.lower().rstrip("/"))
+    return keys
+
+
+def run_prospector(district, max_results, verify, on_progress, seen_before=None):
+    """بيرجّع (DataFrame أو None, إحصائيات)."""
+    seen_before = seen_before or {}
     dz.USAGE["serper_calls"] = 0
     on_progress(0.03, "جاري البحث عن المعارض في Google Maps...")
-    raw_dealers = dz.discover_dealers(district, max_results)
+
+    # بنجيب معارض زيادة عن المطلوب عشان نعوّض اللي هيتشال لأنه مكرر
+    pool = max_results + max(3, (max_results + 1) // 2)
+    raw_dealers = dz.discover_dealers(district, pool, enrich=False)
     if not raw_dealers:
-        return None
+        return None, {}
 
-    rows = []
+    rows, seen_run, new_keys = [], set(), {}
+    stats = {"pool": len(raw_dealers), "duplicates": 0, "fb_pages": 0, "ids_found": 0}
     total = len(raw_dealers)
-    for i, dealer in enumerate(raw_dealers, 1):
-        name = dealer.get("اسم المعرض", "")
-        on_progress(0.15 + 0.85 * (i - 1) / total, f"({i}/{total}) فحص: {name}")
 
+    for i, dealer in enumerate(raw_dealers, 1):
+        if len(rows) >= max_results:
+            break
+        name = dealer.get("اسم المعرض", "")
+        on_progress(0.15 + 0.85 * (i - 1) / total, f"({len(rows)}/{max_results}) فحص: {name}")
+
+        dz.enrich_mobile(dealer)
         phone = best_phone(dealer)
         is_mob = dz.is_mobile_number(phone)
         maps_link = dealer.get("رابط الخريطة") or (
@@ -164,6 +184,25 @@ def run_prospector(district, max_results, verify, on_progress):
         )
 
         v = dz.verify_all_platforms(name, district, phone) if verify else skipped_verification(name)
+
+        fb_url = v.get("facebook_url") or ""
+        keys = dealer_keys(phone, fb_url)
+        if any(k in seen_run for k in keys):
+            stats["duplicates"] += 1  # نفس المعرض (نفس الموبايل أو صفحة الفيس) اتضاف قبل كده
+            continue
+        seen_run.update(keys)
+
+        note = ""
+        prev = next((seen_before[k] for k in keys if k in seen_before), None)
+        if prev and prev != district:
+            note = f"ظهر قبل كده في بحث {prev}"
+        for k in keys:
+            new_keys[k] = district
+
+        if fb_url:
+            stats["fb_pages"] += 1
+            if v.get("facebook_ads_exact"):
+                stats["ids_found"] += 1
 
         dub_res = v.get("dubizzle_results", "")
         cc_res = v.get("contactcars_results", "")
@@ -176,21 +215,23 @@ def run_prospector(district, max_results, verify, on_progress):
             "واتساب": f"https://wa.me/20{phone[1:]}" if is_mob else None,
             "الخريطة": maps_link,
             "Facebook": v["facebook"],
-            "صفحة Facebook": v.get("facebook_url") or None,
+            "صفحة Facebook": fb_url or None,
             "Ads Library": v.get("facebook_ads_link") or None,
             "نوع رابط الإعلانات": (
                 "إعلانات صفحة المعرض" if v.get("facebook_ads_exact")
-                else "بحث بالاسم (راجع النتيجة)"
+                else "بحث باسم الصفحة (راجع النتيجة)"
             ),
             "Dubizzle": v["dubizzle"],
             "رابط Dubizzle": dub_res if dub_res.startswith("http") else None,
             "نوع رابط Dubizzle": v.get("dubizzle_link_kind") or None,
             "ContactCars": v["contactcars"],
             "رابط ContactCars": cc_res if cc_res.startswith("http") else None,
+            "ملاحظات": note or None,
         })
 
+    stats["keys"] = new_keys
     on_progress(1.0, "تم ✅")
-    return pd.DataFrame(rows)
+    return (pd.DataFrame(rows) if rows else None), stats
 
 
 def to_excel_bytes(df):
@@ -284,7 +325,7 @@ with st.container(border=True):
     est = estimate_credits(int(count), verify)
     st.markdown(
         f'<div class="small-note">💳 التكلفة التقريبية: حوالي <b>{est}</b> credit من رصيد Serper '
-        f'({"≈ 3 credit لكل معرض مع الفحص الكامل" if verify else "من غير فحص المنصات الاستهلاك قليل جداً"}). '
+        f'({"≈ 4 credit لكل معرض مع الفحص الكامل" if verify else "من غير فحص المنصات الاستهلاك قليل"}). '
         "جرّب بعدد صغير الأول.</div>",
         unsafe_allow_html=True,
     )
@@ -293,12 +334,13 @@ with st.container(border=True):
 if run:
     bar = st.progress(0.0, text="جاري التجهيز...")
     try:
-        df_new = run_prospector(
+        df_new, run_stats = run_prospector(
             district, int(count), verify,
             lambda p, t: bar.progress(min(max(p, 0.0), 1.0), text=t),
+            seen_before=st.session_state.get("seen_keys", {}),
         )
     except Exception as e:  # عشان أي خطأ يظهر بوضوح بدل شاشة حمراء
-        df_new = None
+        df_new, run_stats = None, {}
         bar.empty()
         st.error(f"حصل خطأ أثناء التشغيل: {e}")
     else:
@@ -311,6 +353,15 @@ if run:
                 "district": district,
                 "calls": dz.USAGE["serper_calls"],
                 "count": len(df_new),
+                "requested": int(count),
+                "duplicates": run_stats.get("duplicates", 0),
+                "fb_pages": run_stats.get("fb_pages", 0),
+                "ids_found": run_stats.get("ids_found", 0),
+                "verified": verify,
+            }
+            # بنحتفظ بأول منطقة ظهر فيها كل معرض عشان نكشف التكرار بين المناطق
+            st.session_state["seen_keys"] = {
+                **run_stats.get("keys", {}), **st.session_state.get("seen_keys", {}),
             }
 
 df = st.session_state.get("leads")
@@ -319,6 +370,17 @@ if df is not None:
     meta = st.session_state.get("meta", {})
     st.success(f"✅ تم استخراج وتأهيل {meta.get('count', len(df))} معرض في {meta.get('district', '')}")
     st.caption(f"🔎 استهلكت العملية {meta.get('calls', 0)} طلب على Serper (≈ {meta.get('calls', 0)} credit).")
+    if meta.get("count", len(df)) < meta.get("requested", 0):
+        st.warning(
+            f"طلبت {meta['requested']} معرض بس لقيت {meta['count']} معرض فعلاً في {meta.get('district', '')}. "
+            "بنستبعد المعارض اللي خارج المنطقة (محافظات تانية) والمكررة "
+            f"(اتشال {meta.get('duplicates', 0)} مكرر). جرّب منطقة أكبر أو منطقة مجاورة."
+        )
+    if meta.get("verified") and meta.get("fb_pages"):
+        st.caption(
+            f"📢 لينك Ads Library بصفحة المعرض نفسها: {meta.get('ids_found', 0)} من {meta['fb_pages']} صفحة. "
+            "الباقي بيبحث باسم الصفحة."
+        )
 
     render_kpis(df)
 
