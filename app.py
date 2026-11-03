@@ -116,18 +116,12 @@ def load_logo_html():
 # منطق التشغيل
 # =========================================================
 
-def ads_library_link(name):
-    return (
-        "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=EG"
-        f"&q={urllib.parse.quote(name)}&search_type=keyword_unordered"
-    )
-
-
 def skipped_verification(name):
     return {
         "facebook": "لم يُفحص", "facebook_url": "",
-        "facebook_ads_link": ads_library_link(name),
-        "dubizzle": "لم يُفحص", "dubizzle_results": "",
+        "facebook_ads_link": dz.ads_library_link(name),
+        "facebook_ads_exact": False,
+        "dubizzle": "لم يُفحص", "dubizzle_results": "", "dubizzle_link_kind": "",
         "contactcars": "لم يُفحص", "contactcars_results": "",
     }
 
@@ -184,8 +178,13 @@ def run_prospector(district, max_results, verify, on_progress):
             "Facebook": v["facebook"],
             "صفحة Facebook": v.get("facebook_url") or None,
             "Ads Library": v.get("facebook_ads_link") or None,
+            "نوع رابط الإعلانات": (
+                "إعلانات صفحة المعرض" if v.get("facebook_ads_exact")
+                else "بحث بالاسم (راجع النتيجة)"
+            ),
             "Dubizzle": v["dubizzle"],
             "رابط Dubizzle": dub_res if dub_res.startswith("http") else None,
+            "نوع رابط Dubizzle": v.get("dubizzle_link_kind") or None,
             "ContactCars": v["contactcars"],
             "رابط ContactCars": cc_res if cc_res.startswith("http") else None,
         })
