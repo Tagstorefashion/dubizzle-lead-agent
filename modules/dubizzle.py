@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import time
@@ -79,10 +80,26 @@ def core_name(name):
     return " ".join(words)
 
 
+def _tokens(text):
+    return set(_arnorm(text).split())
+
+
 def _is_name_match(core, text):
+    """تطابق تقريبي، بس لو الاسم كلمة واحدة لازم تظهر ككلمة كاملة (المهندس != المهندسين)."""
     if len(core) < 4:
         return False
-    return fuzz.partial_ratio(core, _arnorm(text)) >= 90
+    if fuzz.partial_ratio(core, _arnorm(text)) < 90:
+        return False
+    words = core.split()
+    if len(words) == 1:
+        return words[0] in _tokens(text)
+    return True
+
+
+def _strict_name_match(core, text):
+    """كل كلمات الاسم المميز موجودة ككلمات كاملة في النص."""
+    words = core.split()
+    return bool(words) and set(words) <= _tokens(text)
 
 
 _MOBILE_RE = re.compile(
@@ -224,10 +241,13 @@ _IG_SKIP = {"p", "reel", "reels", "explore", "stories", "tv", "accounts", "direc
 
 _FB_ID_PATTERNS = [
     r'"pageID"\s*:\s*"(\d{8,20})"',
-    r'"page_id"\s*:\s*"(\d{8,20})"',
+    r'"page_id"\s*:\s*"?(\d{8,20})"?',
     r'fb://page/\?id=(\d{8,20})',
+    r'fb://page/(\d{8,20})',
     r'fb://profile/(\d{8,20})',
     r'"entity_id"\s*:\s*"(\d{8,20})"',
+    r'"delegate_page_id"\s*:\s*"(\d{8,20})"',
+    r'[?&]page_id=(\d{8,20})',
 ]
 
 
@@ -301,26 +321,43 @@ def extract_fb_page_id(url):
     return None
 
 
-def fetch_fb_page_id(url, timeout=6):
-    """محاولة أخيرة: نقرأ صفحة فيسبوك ونطلّع الـ ID منها. ممكن تفشل لو فيسبوك حجب الطلب."""
-    try:
-        r = requests.get(
-            url,
-            headers={
-                "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-                "Accept-Language": "ar,en;q=0.8",
-            },
-            timeout=timeout,
-        )
-        if r.status_code != 200:
-            return None
-        for pat in _FB_ID_PATTERNS:
-            m = re.search(pat, r.text)
-            if m:
-                return m.group(1)
-    except Exception:
-        pass
+def _fb_id_from_html(html):
+    for pat in _FB_ID_PATTERNS:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
     return None
+
+
+def fetch_fb_page_id(url, timeout=5):
+    """
+    محاولة أخيرة لقراءة الـ page ID من فيسبوك نفسه (من غير توكن).
+    بنجرب: صفحة المعرض كـ crawler، وبعدين Page Plugin. ممكن الاتنين يفشلوا لو فيسبوك حجب الطلب.
+    """
+    attempts = [
+        (url, {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+               "Accept-Language": "ar,en;q=0.8"}),
+        ("https://www.facebook.com/plugins/page.php?href=" + quote(url, safe="") + "&tabs&width=340&height=130",
+         {"User-Agent": HEADERS["User-Agent"], "Accept-Language": "ar,en;q=0.8"}),
+    ]
+    for target, headers in attempts:
+        try:
+            r = requests.get(target, headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                found = _fb_id_from_html(r.text)
+                if found:
+                    return found
+        except Exception:
+            continue
+    return None
+
+
+def facebook_page_name(title):
+    """اسم الصفحة الحقيقي من عنوان نتيجة جوجل: 'معرض سيارات المهندس - Home | Facebook' -> 'معرض سيارات المهندس'."""
+    t = clean_text(title or "")
+    t = re.split(r"\s+[|•–—-]\s+|\s+\(@", t)[0]
+    t = re.sub(r"\b(facebook|instagram)\b", "", t, flags=re.I)
+    return clean_text(t)
 
 
 _BRANCH_MARKERS = [
@@ -349,16 +386,17 @@ def clean_dealer_name(name):
     return clean_text(out) or clean_text(name)
 
 
-def ads_library_link(name, page_id=None):
+def ads_library_link(name, page_id=None, page_name=None):
     """
     لو معانا page ID: بيفتح إعلانات صفحة المعرض نفسها (فيسبوك + انستجرام مع بعض).
-    لو لأ: بحث بالكلمات باسم المعرض بعد شيل اسم الفرع (أقل دقة، ممكن يطلّع صفحات تانية).
-    بنعرض كل الإعلانات (شغالة ومنتهية) عشان الفلتر مايخفّيش حاجة.
+    لو لأ: بحث باسم الصفحة (search_type=page) باسم الصفحة الحقيقي من فيسبوك لو معروف،
+    وإلا اسم المعرض بعد شيل الفرع. بنعرض كل الإعلانات (شغالة ومنتهية).
     """
     base = "https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=EG"
     if page_id:
         return f"{base}&view_all_page_id={page_id}&search_type=page&media_type=all"
-    return f"{base}&q={quote(clean_dealer_name(name))}&search_type=keyword_unordered&media_type=all"
+    q = page_name or clean_dealer_name(name)
+    return f"{base}&q={quote(q)}&search_type=page&media_type=all"
 
 
 # =========================================================
@@ -457,24 +495,34 @@ DZ_KIND_EXPIRED = "إعلان قديم/منتهي"
 
 def check_dubizzle(dealer_name, core, phone):
     """
-    بيرجّع (الحالة, اللينك, نوع اللينك). حالة المنصة نفسها زي ما كانت.
-    اللينك: بنستبعد أي صفحة مش إعلان (بحث/تصنيف)، ونقدّم إعلانات العربيات، وبنفتح أول
-    ٣ مرشحين نشوف مين لسه شغال. لو كلهم منتهيين بنرجّع أحسنهم ونوضّح إنه قديم.
+    بيرجّع (الحالة, اللينك, نوع اللينك).
+    مؤكد بس لو: رقم المعرض ظاهر في إعلان، أو إعلان عربيات باسم المعرض كامل (كلمتين على الأقل).
+    تطابق ضعيف (اسم من كلمة واحدة، أو إعلان مش عربيات) = غير مؤكد ومن غير لينك مضلل.
+    مفيش أي تطابق حقيقي = لم يتم العثور.
     """
     matched = _match_results(
         ["dubizzle.com.eg"], f'site:dubizzle.com.eg "{dealer_name}"', core, phone
     )
     if matched is None:
         return UNKNOWN, "", ""
-    if not matched:
-        return NOT_FOUND, "", ""
 
-    ads = [m for m in matched if _dz_is_ad_url(m["url"])]
-    if not ads:
-        # اتطابق على صفحات مش إعلانات (بحث/تصنيف): نأكد الحالة من غير ما نقدّم لينك مضلل
-        return CONFIRMED, "", ""
+    multi_word = len(core.split()) >= 2
+    strong, weak = [], []
+    for m in matched:
+        if not _dz_is_ad_url(m["url"]):
+            continue
+        text = f'{m["title"]} {m["snippet"]}'
+        if m["by_phone"] or (
+            multi_word and _dz_is_vehicle_ad(m["title"]) and _strict_name_match(core, text)
+        ):
+            strong.append(m)
+        elif _strict_name_match(core, text):
+            weak.append(m)
 
-    ranked = sorted(ads, key=lambda m: (not _dz_is_vehicle_ad(m["title"]), not m["by_phone"]))
+    if not strong:
+        return (UNKNOWN, "", "") if weak else (NOT_FOUND, "", "")
+
+    ranked = sorted(strong, key=lambda m: (not _dz_is_vehicle_ad(m["title"]), not m["by_phone"]))
     first_expired = None
     for m in ranked[:3]:
         expired, profile = _dz_inspect_ad(m["url"])
@@ -490,7 +538,7 @@ def check_dubizzle(dealer_name, core, phone):
 
 def check_facebook(dealer_name, core, phone):
     """
-    بيرجّع (الحالة, رابط الصفحة, page_id).
+    بيرجّع (الحالة, رابط الصفحة, page_id, اسم الصفحة).
     الرابط دايماً صفحة المعرض نفسها (مش بوست)، وفيسبوك مقدَّم على انستجرام.
     """
     matched = _match_results(
@@ -499,29 +547,30 @@ def check_facebook(dealer_name, core, phone):
         core, phone,
     )
     if matched is None:
-        return UNKNOWN, "", None
+        return UNKNOWN, "", None, ""
     if not matched:
-        return NOT_FOUND, "", None
+        return NOT_FOUND, "", None, ""
 
-    candidates = []  # (is_instagram, not_by_phone, order, url, is_fb)
+    candidates = []  # (is_instagram, not_by_phone, order, url, title)
     for i, m in enumerate(matched):
         fb = normalize_facebook_url(m["url"])
         if fb:
-            candidates.append((0, not m["by_phone"], i, fb))
+            candidates.append((0, not m["by_phone"], i, fb, m["title"]))
             continue
         ig = normalize_instagram_url(m["url"])
         if ig:
-            candidates.append((1, not m["by_phone"], i, ig))
+            candidates.append((1, not m["by_phone"], i, ig, m["title"]))
 
     if not candidates:
         # اتلاقى تطابق بس الروابط كلها بوستات/جروبات: مؤكد بس من غير لينك صفحة
-        return CONFIRMED, "", None
+        return CONFIRMED, "", None, ""
 
-    url = sorted(candidates)[0][3]
+    best = sorted(candidates, key=lambda c: c[:3])[0]
+    url, title = best[3], best[4]
     page_id = extract_fb_page_id(url)
     if not page_id and "facebook.com" in url:
         page_id = fetch_fb_page_id(url)
-    return CONFIRMED, url, page_id
+    return CONFIRMED, url, page_id, facebook_page_name(title)
 
 
 def verify_all_platforms(dealer_name, district="", phone=""):
@@ -532,6 +581,7 @@ def verify_all_platforms(dealer_name, district="", phone=""):
         "facebook": UNKNOWN,
         "facebook_url": "",
         "facebook_page_id": None,
+        "facebook_page_name": "",
         "facebook_ads_link": ads_library_link(dealer_name),
         "facebook_ads_exact": False,
         "dubizzle": UNKNOWN,
@@ -545,12 +595,13 @@ def verify_all_platforms(dealer_name, district="", phone=""):
         return status  # الاسم عام جداً، مفيش تحقق موثوق
 
     # فيسبوك / انستجرام (وجود صفحة، مش معناه إعلانات شغالة: استخدم لينك Ad Library)
-    st, url, page_id = check_facebook(dealer_name, core, phone)
+    st, url, page_id, page_name = check_facebook(dealer_name, core, phone)
     status["facebook"] = "موجود (صفحة مؤكدة)" if st == CONFIRMED else st
     status["facebook_url"] = url
     status["facebook_page_id"] = page_id
+    status["facebook_page_name"] = page_name
+    status["facebook_ads_link"] = ads_library_link(dealer_name, page_id, page_name)
     if page_id:
-        status["facebook_ads_link"] = ads_library_link(dealer_name, page_id)
         status["facebook_ads_exact"] = True
     time.sleep(0.1)
 
@@ -595,8 +646,68 @@ def _maps_link(place):
     return ""
 
 
+# مركز كل منطقة (lat, lng) ونصف قطرها بالكيلومتر + كلمات تدل عليها في العنوان
+DISTRICT_GEO = {
+    "مدينة نصر": {"center": (30.0626, 31.3300), "radius": 7.0,
+                  "kw": ["مدينة نصر", "مدينه نصر", "nasr city"]},
+    "مصر الجديدة": {"center": (30.0910, 31.3225), "radius": 5.0,
+                    "kw": ["مصر الجديدة", "مصر الجديده", "heliopolis"]},
+    "المعادي": {"center": (29.9602, 31.2569), "radius": 6.0,
+                "kw": ["المعادي", "المعادى", "maadi"]},
+    "التجمع الخامس": {"center": (30.0074, 31.4913), "radius": 9.0,
+                      "kw": ["التجمع", "القاهرة الجديدة", "new cairo", "fifth settlement", "tagamoa"]},
+    "المهندسين": {"center": (30.0561, 31.2000), "radius": 3.5,
+                  "kw": ["المهندسين", "mohandessin", "mohandiseen", "mohandseen"]},
+    "الدقي": {"center": (30.0382, 31.2123), "radius": 3.5,
+              "kw": ["الدقي", "الدقى", "dokki", "dokki"]},
+    "فيصل": {"center": (29.9981, 31.1700), "radius": 5.0,
+             "kw": ["فيصل", "faisal"]},
+    "الهرم": {"center": (29.9870, 31.1376), "radius": 6.0,
+              "kw": ["الهرم", "haram", "pyramids"]},
+    "6 أكتوبر": {"center": (29.9285, 30.9188), "radius": 14.0,
+                 "kw": ["أكتوبر", "اكتوبر", "october"]},
+    "الشيخ زايد": {"center": (30.0197, 30.9760), "radius": 9.0,
+                   "kw": ["الشيخ زايد", "sheikh zayed", "zayed"]},
+}
+
+
+def _km(lat1, lng1, lat2, lng2):
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi, dl = p2 - p1, math.radians(lng2 - lng1)
+    h = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(h))
+
+
+def _place_in_district(place, district):
+    """
+    هل المعرض فعلاً في المنطقة؟ (جوجل ساعات بيرجّع معرض بنفس الاسم في محافظة تانية).
+    - لو معروفة إحداثياته: لازم يبقى جوه نطاق المنطقة، أو عنوانه فيه اسمها وهو مش بعيد.
+    - لو من غير إحداثيات: لازم العنوان يذكر المنطقة.
+    - منطقة مش معرّفة عندنا: مفيش فلترة.
+    """
+    geo = DISTRICT_GEO.get(district)
+    if not geo:
+        return True
+    address = _arnorm(place.get("address", ""))
+    in_addr = any(_arnorm(k) in address for k in geo["kw"])
+    lat, lng = place.get("latitude"), place.get("longitude")
+    if lat is not None and lng is not None:
+        try:
+            d = _km(float(lat), float(lng), *geo["center"])
+        except (TypeError, ValueError):
+            return in_addr
+        if d <= geo["radius"]:
+            return True
+        return in_addr and d <= geo["radius"] * 2.5
+    return in_addr
+
+
 def _discover_places(district, max_results):
-    keywords = ["معرض سيارات", "معارض سيارات مستعملة", "تجارة سيارات", "car showroom"]
+    keywords = [
+        "معرض سيارات", "معارض سيارات مستعملة", "تجارة سيارات", "car showroom",
+        "بيع وشراء سيارات", "سيارات مستعملة", "car dealer", "used cars",
+    ]
     seen, dealers = set(), []
 
     for kw in keywords:
@@ -608,15 +719,19 @@ def _discover_places(district, max_results):
             if not places:
                 break
 
+            added = 0
             for p in places:
                 name = clean_text(p.get("title", ""))
                 category = (p.get("category") or "").lower()
                 if not name or any(b in category for b in _BAD_CATEGORIES):
                     continue
+                if not _place_in_district(p, district):
+                    continue
                 uid = p.get("cid") or f'{name}|{p.get("address", "")}'
                 if uid in seen:
                     continue
                 seen.add(uid)
+                added += 1
 
                 phone = clean_text(p.get("phoneNumber", ""))
                 address = clean_text(p.get("address", ""))
@@ -634,6 +749,8 @@ def _discover_places(district, max_results):
 
             if len(dealers) >= max_results:
                 return dealers[:max_results]
+            if added == 0:
+                break  # الصفحة دي مفيهاش جديد في المنطقة: مفيش داعي نصرف credit على صفحات أكتر
 
     return dealers[:max_results]
 
@@ -771,7 +888,7 @@ def _discover_free(district, max_results):
 # الدالة الرئيسية
 # =========================================================
 
-def discover_dealers(district, max_results=10):
+def discover_dealers(district, max_results=10, enrich=True):
     dealers = []
 
     if _key():
@@ -790,10 +907,16 @@ def discover_dealers(district, max_results=10):
             break
 
     # محاولة إيجاد موبايل للمعارض اللي رقمها أرضي أو ناقص (بتستهلك بحث لكل معرض)
-    if _key():
+    if enrich and _key():
         for dealer in unique:
             if not is_mobile_number(dealer.get("الهاتف", "")):
                 _enrich_mobile(dealer)
                 time.sleep(0.1)
 
     return unique
+
+
+def enrich_mobile(dealer):
+    """نفس _enrich_mobile بس متاحة من برّه (التطبيق بيستخدمها لكل معرض لما ييجي دوره)."""
+    if _key() and not is_mobile_number(dealer.get("الهاتف", "")):
+        _enrich_mobile(dealer)
