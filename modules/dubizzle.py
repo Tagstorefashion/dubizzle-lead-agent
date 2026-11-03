@@ -210,37 +210,276 @@ def extract_dealer_name(title, snippet, url):
 
 
 # =========================================================
+# روابط فيسبوك / انستجرام / Ads Library
+# =========================================================
+
+# أول جزء في المسار اللي مش اسم صفحة (بوستات، جروبات، صور...)
+_FB_SKIP = {
+    "groups", "events", "marketplace", "watch", "reel", "reels", "share", "sharer",
+    "photo", "photos", "photo.php", "video", "videos", "hashtag", "login", "public",
+    "story.php", "permalink.php", "people", "l.php", "dialog", "policies", "help",
+    "ads", "business", "gaming", "stories", "posts", "media", "plugins", "tr",
+}
+_IG_SKIP = {"p", "reel", "reels", "explore", "stories", "tv", "accounts", "directory"}
+
+_FB_ID_PATTERNS = [
+    r'"pageID"\s*:\s*"(\d{8,20})"',
+    r'"page_id"\s*:\s*"(\d{8,20})"',
+    r'fb://page/\?id=(\d{8,20})',
+    r'fb://profile/(\d{8,20})',
+    r'"entity_id"\s*:\s*"(\d{8,20})"',
+]
+
+
+def normalize_facebook_url(url):
+    """يرجّع رابط الصفحة نفسها (مش بوست ولا صورة)، أو None لو الرابط مش صفحة."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return None
+    if not p.netloc.lower().endswith("facebook.com"):
+        return None
+    path = [s for s in p.path.split("/") if s]
+    if path and re.fullmatch(r"[a-z]{2}-[a-z]{2}", path[0].lower()):
+        path = path[1:]
+    if not path:
+        return None
+
+    first = path[0].lower()
+    if first == "profile.php":
+        pid = parse_qs(p.query).get("id", [""])[0]
+        return f"https://www.facebook.com/profile.php?id={pid}" if pid.isdigit() else None
+    if first == "pages":
+        if len(path) >= 4 and path[1].lower() == "category":
+            return "https://www.facebook.com/" + "/".join(path[:4])
+        if len(path) >= 3:
+            return "https://www.facebook.com/" + "/".join(path[:3])
+        return None
+    if first in _FB_SKIP:
+        return None
+    return f"https://www.facebook.com/{path[0]}"
+
+
+def normalize_instagram_url(url):
+    try:
+        p = urlparse(url)
+    except Exception:
+        return None
+    if not p.netloc.lower().endswith("instagram.com"):
+        return None
+    path = [s for s in p.path.split("/") if s]
+    if not path or path[0].lower() in _IG_SKIP:
+        return None
+    return f"https://www.instagram.com/{path[0]}/"
+
+
+def extract_fb_page_id(url):
+    """بيطلّع الـ page ID من شكل الرابط نفسه (من غير أي طلب إنترنت). أو None."""
+    if not url:
+        return None
+    try:
+        p = urlparse(url)
+    except Exception:
+        return None
+    path = [s for s in p.path.split("/") if s]
+
+    if path and path[0].lower() == "profile.php":
+        pid = parse_qs(p.query).get("id", [""])[0]
+        return pid if pid.isdigit() else None
+    if path and path[0].lower() == "pages":
+        for seg in reversed(path):
+            if seg.isdigit() and len(seg) >= 8:
+                return seg
+        m = re.search(r"-(\d{10,20})$", path[-1])
+        return m.group(1) if m else None
+    if path:
+        if path[0].isdigit() and len(path[0]) >= 8:
+            return path[0]
+        m = re.search(r"-(\d{10,20})$", path[0])  # زي Name-100064123456789
+        if m:
+            return m.group(1)
+    return None
+
+
+def fetch_fb_page_id(url, timeout=6):
+    """محاولة أخيرة: نقرأ صفحة فيسبوك ونطلّع الـ ID منها. ممكن تفشل لو فيسبوك حجب الطلب."""
+    try:
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+                "Accept-Language": "ar,en;q=0.8",
+            },
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            return None
+        for pat in _FB_ID_PATTERNS:
+            m = re.search(pat, r.text)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def ads_library_link(name, page_id=None):
+    """
+    لو معانا page ID: بيفتح إعلانات صفحة المعرض نفسها (فيسبوك + انستجرام مع بعض).
+    لو لأ: بحث باسم الصفحة (أقل دقة، ممكن يطلّع صفحات تانية بنفس الاسم).
+    """
+    base = "https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=EG"
+    if page_id:
+        return f"{base}&view_all_page_id={page_id}&search_type=page&media_type=all"
+    return f"{base}&q={quote(name)}&search_type=page&media_type=all"
+
+
+# =========================================================
 # التحقق من المنصات
 # =========================================================
 
-def _check(domains, query, core, phone):
-    """بيرجّع (الحالة, اللينك). مؤكد بس لو الاسم أو الرقم اتطابق فعلاً."""
-    results = _search_web(query)
+def _match_results(domains, query, core, phone):
+    """
+    بيرجّع None لو البحث فشل، وإلا list بكل النتايج اللي اتطابقت (بالاسم أو الرقم).
+    كل عنصر: {"url","title","snippet","by_phone"}.
+    """
+    results = _search_web(query, max_results=10)
     if results is None:
-        return UNKNOWN, ""
+        return None
     last9 = clean_digits(phone)[-9:] if len(clean_digits(phone)) >= 9 else ""
+    matched = []
     for r in results:
         if not any(d in r["url"] for d in domains):
             continue
         text = f'{r["title"]} {r["snippet"]}'
-        if (last9 and last9 in clean_digits(text)) or _is_name_match(core, text):
-            return CONFIRMED, r["url"]
+        by_phone = bool(last9 and last9 in clean_digits(text))
+        if by_phone or _is_name_match(core, text):
+            matched.append({**r, "by_phone": by_phone})
+    return matched
+
+
+def _check(domains, query, core, phone):
+    """بيرجّع (الحالة, اللينك). مؤكد بس لو الاسم أو الرقم اتطابق فعلاً."""
+    matched = _match_results(domains, query, core, phone)
+    if matched is None:
+        return UNKNOWN, ""
+    if matched:
+        best = sorted(matched, key=lambda m: not m["by_phone"])[0]
+        return CONFIRMED, best["url"]
     return NOT_FOUND, ""
+
+
+# كلمات في عنوان إعلان دوبيزل معناها إنه مش إعلان عربيات (عقار، قطع غيار، موتوسيكل...)
+_DZ_NON_VEHICLE = [_arnorm(w) for w in [
+    "commercial", "properties", "property", "for rent", "عقار", "للايجار", "للإيجار",
+    "قطع غيار", "spare parts", "موتوسيكل", "motorcycle", "اكسسوار", "accessories",
+    "شقق", "apartment", "فيلا", "villa", "اراضي", "أراضي", "land", "وظائف", "jobs",
+    "services", "خدمات",
+]]
+
+
+def _dz_is_vehicle_ad(title):
+    t = _arnorm(title)
+    if any(w in t for w in _DZ_NON_VEHICLE):
+        return False
+    return (
+        "سيارات للبيع" in t
+        or "cars for sale" in t
+        or bool(re.search(r"سيارات \d+$", t))
+    )
+
+
+def _dz_find_profile(ad_url, timeout=6):
+    """لو صفحة الإعلان فيها لينك لصفحة البائع (كل إعلاناته) نرجّعه. وإلا None."""
+    try:
+        r = requests.get(ad_url, headers=HEADERS, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        m = re.search(r'href="((?:https://www\.dubizzle\.com\.eg)?/(?:en/|ar/)?profile/[\w\-]+/?)"', r.text)
+        if m:
+            return urljoin("https://www.dubizzle.com.eg", m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+DZ_KIND_PROFILE = "صفحة البائع"
+DZ_KIND_VEHICLE_AD = "إعلان سيارة للمعرض"
+DZ_KIND_OTHER_AD = "إعلان (مش سيارات)"
+
+
+def check_dubizzle(dealer_name, core, phone):
+    """
+    بيرجّع (الحالة, اللينك, نوع اللينك).
+    الحالة زي ما كانت. الجديد: اللينك بيتختار من بين كل النتايج:
+    صفحة البائع لو اتلاقت > إعلان عربيات بنفس رقم المعرض > إعلان عربيات بنفس الاسم > أي إعلان.
+    """
+    matched = _match_results(
+        ["dubizzle.com.eg"], f'site:dubizzle.com.eg "{dealer_name}"', core, phone
+    )
+    if matched is None:
+        return UNKNOWN, "", ""
+    if not matched:
+        return NOT_FOUND, "", ""
+
+    best = sorted(
+        matched, key=lambda m: (not _dz_is_vehicle_ad(m["title"]), not m["by_phone"])
+    )[0]
+    profile = _dz_find_profile(best["url"])
+    if profile:
+        return CONFIRMED, profile, DZ_KIND_PROFILE
+    kind = DZ_KIND_VEHICLE_AD if _dz_is_vehicle_ad(best["title"]) else DZ_KIND_OTHER_AD
+    return CONFIRMED, best["url"], kind
+
+
+def check_facebook(dealer_name, core, phone):
+    """
+    بيرجّع (الحالة, رابط الصفحة, page_id).
+    الرابط دايماً صفحة المعرض نفسها (مش بوست)، وفيسبوك مقدَّم على انستجرام.
+    """
+    matched = _match_results(
+        ["facebook.com", "instagram.com"],
+        f'(site:facebook.com OR site:instagram.com) "{dealer_name}"',
+        core, phone,
+    )
+    if matched is None:
+        return UNKNOWN, "", None
+    if not matched:
+        return NOT_FOUND, "", None
+
+    candidates = []  # (is_instagram, not_by_phone, order, url, is_fb)
+    for i, m in enumerate(matched):
+        fb = normalize_facebook_url(m["url"])
+        if fb:
+            candidates.append((0, not m["by_phone"], i, fb))
+            continue
+        ig = normalize_instagram_url(m["url"])
+        if ig:
+            candidates.append((1, not m["by_phone"], i, ig))
+
+    if not candidates:
+        # اتلاقى تطابق بس الروابط كلها بوستات/جروبات: مؤكد بس من غير لينك صفحة
+        return CONFIRMED, "", None
+
+    url = sorted(candidates)[0][3]
+    page_id = extract_fb_page_id(url)
+    if not page_id and "facebook.com" in url:
+        page_id = fetch_fb_page_id(url)
+    return CONFIRMED, url, page_id
 
 
 def verify_all_platforms(dealer_name, district="", phone=""):
     core = core_name(dealer_name)
-    ads_link = (
-        "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=EG"
-        f"&q={quote(dealer_name)}&search_type=keyword_unordered"
-    )
 
     status = {
         "facebook": UNKNOWN,
         "facebook_url": "",
-        "facebook_ads_link": ads_link,
+        "facebook_page_id": None,
+        "facebook_ads_link": ads_library_link(dealer_name),
+        "facebook_ads_exact": False,
         "dubizzle": UNKNOWN,
         "dubizzle_results": "يحتاج فحص يدوي",
+        "dubizzle_link_kind": "",
         "contactcars": UNKNOWN,
         "contactcars_results": "يحتاج فحص يدوي",
     }
@@ -249,21 +488,20 @@ def verify_all_platforms(dealer_name, district="", phone=""):
         return status  # الاسم عام جداً، مفيش تحقق موثوق
 
     # فيسبوك / انستجرام (وجود صفحة، مش معناه إعلانات شغالة: استخدم لينك Ad Library)
-    st, url = _check(
-        ["facebook.com", "instagram.com"],
-        f'(site:facebook.com OR site:instagram.com) "{dealer_name}"',
-        core, phone,
-    )
+    st, url, page_id = check_facebook(dealer_name, core, phone)
     status["facebook"] = "موجود (صفحة مؤكدة)" if st == CONFIRMED else st
     status["facebook_url"] = url
+    status["facebook_page_id"] = page_id
+    if page_id:
+        status["facebook_ads_link"] = ads_library_link(dealer_name, page_id)
+        status["facebook_ads_exact"] = True
     time.sleep(0.1)
 
     # دوبيزل
-    st, url = _check(
-        ["dubizzle.com.eg"], f'site:dubizzle.com.eg "{dealer_name}"', core, phone
-    )
+    st, url, kind = check_dubizzle(dealer_name, core, phone)
     if st == CONFIRMED:
         status["dubizzle"], status["dubizzle_results"] = "مشترك (مؤكد)", url
+        status["dubizzle_link_kind"] = kind
     elif st == NOT_FOUND:
         status["dubizzle"], status["dubizzle_results"] = "لم يتم العثور", "فرصة استهداف"
     time.sleep(0.1)
