@@ -323,15 +323,42 @@ def fetch_fb_page_id(url, timeout=6):
     return None
 
 
+_BRANCH_MARKERS = [
+    "branch", "فرع", "nasr city", "مدينة نصر", "maadi", "المعادي", "heliopolis",
+    "مصر الجديدة", "new cairo", "التجمع", "mohandessin", "المهندسين", "dokki", "الدقي",
+    "faisal", "فيصل", "haram", "الهرم", "october", "أكتوبر", "اكتوبر", "zayed", "زايد",
+    "cairo", "القاهرة", "giza", "الجيزة",
+]
+
+
+def clean_dealer_name(name):
+    """
+    بيشيل اسم الفرع/المنطقة من اسم Google Maps:
+    "Auto Samir Rayan - Nasr City Branch" -> "Auto Samir Rayan"
+    لأن صفحة المعرض على فيسبوك ودوبيزل نادراً بيبقى اسمها فيه الفرع.
+    """
+    n = clean_text(re.sub(r"\(.*?\)", " ", name or ""))
+    parts = [p for p in re.split(r"\s+[-–—|]\s+|\s*\|\s*", n) if p.strip()]
+    if not parts:
+        return clean_text(name)
+    kept = [parts[0]] + [
+        p for p in parts[1:] if not any(m in p.lower() for m in _BRANCH_MARKERS)
+    ]
+    out = clean_text(" - ".join(kept))
+    out = re.sub(r"\s+(?:branch|فرع)\b.*$", "", out, flags=re.I)
+    return clean_text(out) or clean_text(name)
+
+
 def ads_library_link(name, page_id=None):
     """
     لو معانا page ID: بيفتح إعلانات صفحة المعرض نفسها (فيسبوك + انستجرام مع بعض).
-    لو لأ: بحث باسم الصفحة (أقل دقة، ممكن يطلّع صفحات تانية بنفس الاسم).
+    لو لأ: بحث بالكلمات باسم المعرض بعد شيل اسم الفرع (أقل دقة، ممكن يطلّع صفحات تانية).
+    بنعرض كل الإعلانات (شغالة ومنتهية) عشان الفلتر مايخفّيش حاجة.
     """
     base = "https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=EG"
     if page_id:
         return f"{base}&view_all_page_id={page_id}&search_type=page&media_type=all"
-    return f"{base}&q={quote(name)}&search_type=page&media_type=all"
+    return f"{base}&q={quote(clean_dealer_name(name))}&search_type=keyword_unordered&media_type=all"
 
 
 # =========================================================
@@ -377,42 +404,62 @@ _DZ_NON_VEHICLE = [_arnorm(w) for w in [
     "services", "خدمات",
 ]]
 
+# صفحة إعلان حقيقية: .../ad/<عنوان>-ID123456.html (مش صفحة بحث ولا تصنيف)
+_DZ_AD_URL = re.compile(r"dubizzle\.com\.eg/(?:[a-z]{2}/)?ad/.+-ID\d+\.html", re.I)
+
+# علامات إن الإعلان انتهى/اتشال
+_DZ_EXPIRED_MARKERS = [
+    "هذا الإعلان غير متاح", "هذا الاعلان غير متاح",
+    "this ad is no longer available", "this ad is not available",
+]
+
+
+def _dz_is_ad_url(url):
+    return bool(_DZ_AD_URL.search(url or ""))
+
 
 def _dz_is_vehicle_ad(title):
+    """إعلان عربيات للبيع (مش عقار/قطع غيار/خدمات)، من عنوان النتيجة."""
     t = _arnorm(title)
     if any(w in t for w in _DZ_NON_VEHICLE):
         return False
-    return (
-        "سيارات للبيع" in t
-        or "cars for sale" in t
-        or bool(re.search(r"سيارات \d+$", t))
-    )
+    return "سيارات للبيع" in t or "cars for sale" in t
 
 
-def _dz_find_profile(ad_url, timeout=6):
-    """لو صفحة الإعلان فيها لينك لصفحة البائع (كل إعلاناته) نرجّعه. وإلا None."""
+def _dz_inspect_ad(ad_url, timeout=5):
+    """
+    بيفتح صفحة الإعلان (لو دوبيزل سمح) ويرجّع (منتهي؟, لينك صفحة البائع).
+    منتهي = True/False، أو None لو معرفناش نقرأ الصفحة. الأخطاء مش بتوقف البرنامج.
+    """
     try:
         r = requests.get(ad_url, headers=HEADERS, timeout=timeout)
+        if r.status_code in (404, 410):
+            return True, None
         if r.status_code != 200:
-            return None
-        m = re.search(r'href="((?:https://www\.dubizzle\.com\.eg)?/(?:en/|ar/)?profile/[\w\-]+/?)"', r.text)
-        if m:
-            return urljoin("https://www.dubizzle.com.eg", m.group(1))
+            return None, None
+        html = r.text
+        low = html.lower()
+        expired = any(m.lower() in low for m in _DZ_EXPIRED_MARKERS)
+        m = re.search(
+            r'href="((?:https://www\.dubizzle\.com\.eg)?/(?:en/|ar/)?profile/[\w\-]+/?)"', html
+        )
+        profile = urljoin("https://www.dubizzle.com.eg", m.group(1)) if m else None
+        return expired, profile
     except Exception:
-        pass
-    return None
+        return None, None
 
 
 DZ_KIND_PROFILE = "صفحة البائع"
 DZ_KIND_VEHICLE_AD = "إعلان سيارة للمعرض"
 DZ_KIND_OTHER_AD = "إعلان (مش سيارات)"
+DZ_KIND_EXPIRED = "إعلان قديم/منتهي"
 
 
 def check_dubizzle(dealer_name, core, phone):
     """
-    بيرجّع (الحالة, اللينك, نوع اللينك).
-    الحالة زي ما كانت. الجديد: اللينك بيتختار من بين كل النتايج:
-    صفحة البائع لو اتلاقت > إعلان عربيات بنفس رقم المعرض > إعلان عربيات بنفس الاسم > أي إعلان.
+    بيرجّع (الحالة, اللينك, نوع اللينك). حالة المنصة نفسها زي ما كانت.
+    اللينك: بنستبعد أي صفحة مش إعلان (بحث/تصنيف)، ونقدّم إعلانات العربيات، وبنفتح أول
+    ٣ مرشحين نشوف مين لسه شغال. لو كلهم منتهيين بنرجّع أحسنهم ونوضّح إنه قديم.
     """
     matched = _match_results(
         ["dubizzle.com.eg"], f'site:dubizzle.com.eg "{dealer_name}"', core, phone
@@ -422,14 +469,23 @@ def check_dubizzle(dealer_name, core, phone):
     if not matched:
         return NOT_FOUND, "", ""
 
-    best = sorted(
-        matched, key=lambda m: (not _dz_is_vehicle_ad(m["title"]), not m["by_phone"])
-    )[0]
-    profile = _dz_find_profile(best["url"])
-    if profile:
-        return CONFIRMED, profile, DZ_KIND_PROFILE
-    kind = DZ_KIND_VEHICLE_AD if _dz_is_vehicle_ad(best["title"]) else DZ_KIND_OTHER_AD
-    return CONFIRMED, best["url"], kind
+    ads = [m for m in matched if _dz_is_ad_url(m["url"])]
+    if not ads:
+        # اتطابق على صفحات مش إعلانات (بحث/تصنيف): نأكد الحالة من غير ما نقدّم لينك مضلل
+        return CONFIRMED, "", ""
+
+    ranked = sorted(ads, key=lambda m: (not _dz_is_vehicle_ad(m["title"]), not m["by_phone"]))
+    first_expired = None
+    for m in ranked[:3]:
+        expired, profile = _dz_inspect_ad(m["url"])
+        if profile:
+            return CONFIRMED, profile, DZ_KIND_PROFILE
+        if expired:
+            first_expired = first_expired or m
+            continue
+        kind = DZ_KIND_VEHICLE_AD if _dz_is_vehicle_ad(m["title"]) else DZ_KIND_OTHER_AD
+        return CONFIRMED, m["url"], kind
+    return CONFIRMED, first_expired["url"], DZ_KIND_EXPIRED
 
 
 def check_facebook(dealer_name, core, phone):
@@ -469,6 +525,7 @@ def check_facebook(dealer_name, core, phone):
 
 
 def verify_all_platforms(dealer_name, district="", phone=""):
+    dealer_name = clean_dealer_name(dealer_name)  # بدون اسم الفرع/المنطقة
     core = core_name(dealer_name)
 
     status = {
