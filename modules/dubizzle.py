@@ -1,6 +1,8 @@
+import json
 import math
 import os
 import re
+import threading
 import time
 from urllib.parse import quote, urljoin, urlparse, parse_qs, unquote
 
@@ -142,24 +144,45 @@ def is_mobile_number(value):
 
 # عدّاد طلبات Serper (كل طلب = credit واحد تقريباً). التطبيق بيصفّره في أول كل عملية.
 USAGE = {"serper_calls": 0}
+_USAGE_LOCK = threading.Lock()
+
+
+_SERPER_CACHE = {}
 
 
 def _serper(endpoint, payload):
+    """
+    طلب Serper مع: كاش (نفس الطلب مايخصمش credit تاني)، وإعادة محاولة عند 429/5xx.
+    الـ credit بيتعدّ بس لما الطلب ينجح.
+    """
     key = _key()
     if not key:
         return None
-    USAGE["serper_calls"] += 1
-    try:
-        r = requests.post(
-            endpoint,
-            json=payload,
-            headers={"X-API-KEY": key, "Content-Type": "application/json"},
-            timeout=15,
-        )
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
+    ck = endpoint + json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    if ck in _SERPER_CACHE:
+        return _SERPER_CACHE[ck]
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                endpoint,
+                json=payload,
+                headers={"X-API-KEY": key, "Content-Type": "application/json"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                with _USAGE_LOCK:
+                    USAGE["serper_calls"] += 1
+                data = r.json()
+                if len(_SERPER_CACHE) > 20000:
+                    _SERPER_CACHE.clear()
+                _SERPER_CACHE[ck] = data
+                return data
+            if r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return None
+        except Exception:
+            time.sleep(1.0 * (attempt + 1))
     return None
 
 
@@ -329,10 +352,25 @@ def _fb_id_from_html(html):
     return None
 
 
-def fetch_fb_page_id(url, timeout=5):
+def _fb_meta_text(html_text):
+    """نص الوصف في ميتا تاجز صفحة فيسبوك (og:description وغيره). ده أأمن مكان نقرأ منه رقم تليفون."""
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+    except Exception:
+        return ""
+    parts = []
+    for attrs in ({"property": "og:description"}, {"name": "description"},
+                  {"name": "twitter:description"}, {"property": "og:title"}):
+        tag = soup.find("meta", attrs=attrs)
+        if tag and tag.get("content"):
+            parts.append(tag["content"])
+    return " ".join(parts)
+
+
+def fetch_fb_page_info(url, timeout=5):
     """
-    محاولة أخيرة لقراءة الـ page ID من فيسبوك نفسه (من غير توكن).
-    بنجرب: صفحة المعرض كـ crawler، وبعدين Page Plugin. ممكن الاتنين يفشلوا لو فيسبوك حجب الطلب.
+    بيقرا صفحة فيسبوك نفسها (من غير توكن ومن غير credits) ويطلّع:
+    (page_id, موبايل ظاهر في وصف الصفحة). ممكن الاتنين يرجعوا فاضيين لو فيسبوك حجب الطلب.
     """
     attempts = [
         (url, {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
@@ -340,16 +378,27 @@ def fetch_fb_page_id(url, timeout=5):
         ("https://www.facebook.com/plugins/page.php?href=" + quote(url, safe="") + "&tabs&width=340&height=130",
          {"User-Agent": HEADERS["User-Agent"], "Accept-Language": "ar,en;q=0.8"}),
     ]
+    page_id, mobile = None, ""
     for target, headers in attempts:
         try:
             r = requests.get(target, headers=headers, timeout=timeout)
-            if r.status_code == 200:
-                found = _fb_id_from_html(r.text)
-                if found:
-                    return found
+            if r.status_code != 200:
+                continue
+            if not page_id:
+                page_id = _fb_id_from_html(r.text)
+            if not mobile:
+                found = extract_mobile_phone(_fb_meta_text(r.text))
+                if is_mobile_number(found):
+                    mobile = found
         except Exception:
             continue
-    return None
+        if page_id and mobile:
+            break
+    return page_id, mobile
+
+
+def fetch_fb_page_id(url, timeout=5):
+    return fetch_fb_page_info(url, timeout)[0]
 
 
 def facebook_page_name(title):
@@ -538,7 +587,7 @@ def check_dubizzle(dealer_name, core, phone):
 
 def check_facebook(dealer_name, core, phone):
     """
-    بيرجّع (الحالة, رابط الصفحة, page_id, اسم الصفحة).
+    بيرجّع (الحالة, رابط الصفحة, page_id, اسم الصفحة, موبايل لقيناه في نتايج فيسبوك).
     الرابط دايماً صفحة المعرض نفسها (مش بوست)، وفيسبوك مقدَّم على انستجرام.
     """
     matched = _match_results(
@@ -547,9 +596,17 @@ def check_facebook(dealer_name, core, phone):
         core, phone,
     )
     if matched is None:
-        return UNKNOWN, "", None, ""
+        return UNKNOWN, "", None, "", ""
     if not matched:
-        return NOT_FOUND, "", None, ""
+        return NOT_FOUND, "", None, "", ""
+
+    # موبايل ظاهر في نتيجة فيسبوك/انستجرام نفسها (مفيد لو رقم الخرائط أرضي)
+    phone_found = ""
+    for m in matched:
+        mob = extract_mobile_phone(f'{m["title"]} {m["snippet"]}')
+        if is_mobile_number(mob):
+            phone_found = mob
+            break
 
     candidates = []  # (is_instagram, not_by_phone, order, url, title)
     for i, m in enumerate(matched):
@@ -563,14 +620,16 @@ def check_facebook(dealer_name, core, phone):
 
     if not candidates:
         # اتلاقى تطابق بس الروابط كلها بوستات/جروبات: مؤكد بس من غير لينك صفحة
-        return CONFIRMED, "", None, ""
+        return CONFIRMED, "", None, "", phone_found
 
     best = sorted(candidates, key=lambda c: c[:3])[0]
     url, title = best[3], best[4]
     page_id = extract_fb_page_id(url)
-    if not page_id and "facebook.com" in url:
-        page_id = fetch_fb_page_id(url)
-    return CONFIRMED, url, page_id, facebook_page_name(title)
+    if "facebook.com" in url and (not page_id or not phone_found):
+        fetched_id, fetched_mobile = fetch_fb_page_info(url)
+        page_id = page_id or fetched_id
+        phone_found = phone_found or fetched_mobile
+    return CONFIRMED, url, page_id, facebook_page_name(title), phone_found
 
 
 def verify_all_platforms(dealer_name, district="", phone=""):
@@ -582,6 +641,7 @@ def verify_all_platforms(dealer_name, district="", phone=""):
         "facebook_url": "",
         "facebook_page_id": None,
         "facebook_page_name": "",
+        "phone_found": "",
         "facebook_ads_link": ads_library_link(dealer_name),
         "facebook_ads_exact": False,
         "dubizzle": UNKNOWN,
@@ -595,11 +655,12 @@ def verify_all_platforms(dealer_name, district="", phone=""):
         return status  # الاسم عام جداً، مفيش تحقق موثوق
 
     # فيسبوك / انستجرام (وجود صفحة، مش معناه إعلانات شغالة: استخدم لينك Ad Library)
-    st, url, page_id, page_name = check_facebook(dealer_name, core, phone)
+    st, url, page_id, page_name, phone_found = check_facebook(dealer_name, core, phone)
     status["facebook"] = "موجود (صفحة مؤكدة)" if st == CONFIRMED else st
     status["facebook_url"] = url
     status["facebook_page_id"] = page_id
     status["facebook_page_name"] = page_name
+    status["phone_found"] = phone_found
     status["facebook_ads_link"] = ads_library_link(dealer_name, page_id, page_name)
     if page_id:
         status["facebook_ads_exact"] = True
@@ -646,28 +707,99 @@ def _maps_link(place):
     return ""
 
 
-# مركز كل منطقة (lat, lng) ونصف قطرها بالكيلومتر + كلمات تدل عليها في العنوان
+# المحافظات والمناطق: (الاسم, lat, lng, نصف القطر كم, كلمات تدل عليها في العنوان)
+# الإحداثيات تقريبية، بنستخدمها بس عشان نستبعد معارض محافظات/مناطق بعيدة.
+_REGION_ROWS = {
+    "القاهرة": [
+        ("مدينة نصر", 30.0626, 31.3300, 7, ["مدينة نصر", "مدينه نصر", "nasr city"]),
+        ("مصر الجديدة", 30.0910, 31.3225, 5, ["مصر الجديدة", "مصر الجديده", "heliopolis"]),
+        ("المعادي", 29.9602, 31.2569, 6, ["المعادي", "المعادى", "maadi"]),
+        ("التجمع الخامس", 30.0074, 31.4913, 9, ["التجمع", "القاهرة الجديدة", "new cairo", "fifth settlement", "tagamoa"]),
+        ("الرحاب", 30.0585, 31.4900, 4, ["الرحاب", "rehab", "el rehab"]),
+        ("المقطم", 30.0131, 31.3000, 5, ["المقطم", "mokattam", "muqattam"]),
+        ("عين شمس", 30.1318, 31.3243, 4, ["عين شمس", "ain shams"]),
+        ("المرج", 30.1514, 31.3342, 4, ["المرج", "marg", "el marg"]),
+        ("شبرا", 30.1060, 31.2450, 4, ["شبرا", "shubra", "shoubra"]),
+        ("وسط البلد", 30.0444, 31.2357, 2.5, ["وسط البلد", "downtown"]),
+        ("حلوان", 29.8419, 31.3342, 6, ["حلوان", "helwan"]),
+        ("الشروق", 30.1255, 31.6040, 8, ["الشروق", "shorouk", "shorouq"]),
+    ],
+    "الجيزة": [
+        ("المهندسين", 30.0561, 31.2000, 3.5, ["المهندسين", "mohandessin", "mohandiseen", "mohandseen"]),
+        ("الدقي", 30.0382, 31.2123, 3.5, ["الدقي", "الدقى", "dokki"]),
+        ("فيصل", 29.9981, 31.1700, 5, ["فيصل", "faisal"]),
+        ("الهرم", 29.9870, 31.1376, 6, ["الهرم", "haram", "pyramids"]),
+        ("إمبابة", 30.0760, 31.2080, 3, ["إمبابة", "امبابة", "imbaba"]),
+        ("بولاق الدكرور", 30.0300, 31.1650, 3, ["بولاق الدكرور", "bulaq", "boulaq"]),
+        ("6 أكتوبر", 29.9285, 30.9188, 14, ["أكتوبر", "اكتوبر", "october"]),
+        ("الشيخ زايد", 30.0197, 30.9760, 9, ["الشيخ زايد", "sheikh zayed", "zayed"]),
+    ],
+    "الإسكندرية": [
+        ("سموحة", 31.2150, 29.9420, 3, ["سموحة", "smouha"]),
+        ("سيدي بشر", 31.2600, 29.9750, 3, ["سيدي بشر", "sidi bishr"]),
+        ("ميامي", 31.2650, 30.0000, 3, ["ميامي", "miami"]),
+        ("المنتزه", 31.2860, 30.0170, 4, ["المنتزه", "montaza", "montazah"]),
+        ("العجمي", 31.1040, 29.7670, 6, ["العجمي", "agami", "agamy"]),
+        ("محطة الرمل", 31.2010, 29.9020, 2.5, ["محطة الرمل", "raml station", "mahatet el raml"]),
+        ("برج العرب", 30.8520, 29.5640, 10, ["برج العرب", "borg el arab", "burj al arab", "borg el-arab"]),
+    ],
+    "القليوبية": [
+        ("بنها", 30.4660, 31.1850, 6, ["بنها", "banha", "benha"]),
+        ("شبرا الخيمة", 30.1286, 31.2422, 4, ["شبرا الخيمة", "shubra el kheima", "shoubra el kheima"]),
+        ("العبور", 30.2147, 31.4678, 8, ["العبور", "obour", "obor"]),
+    ],
+    "الدقهلية": [
+        ("المنصورة", 31.0409, 31.3785, 7, ["المنصورة", "mansoura"]),
+        ("ميت غمر", 30.7140, 31.2590, 4, ["ميت غمر", "mit ghamr"]),
+    ],
+    "الشرقية": [
+        ("الزقازيق", 30.5877, 31.5020, 6, ["الزقازيق", "zagazig"]),
+        ("العاشر من رمضان", 30.2936, 31.7508, 10, ["العاشر من رمضان", "10th of ramadan", "tenth of ramadan"]),
+        ("بلبيس", 30.4199, 31.5614, 4, ["بلبيس", "belbeis", "bilbeis"]),
+    ],
+    "الغربية": [
+        ("طنطا", 30.7865, 31.0004, 6, ["طنطا", "tanta"]),
+        ("المحلة الكبرى", 30.9700, 31.1669, 6, ["المحلة", "mahalla"]),
+    ],
+    "المنوفية": [
+        ("شبين الكوم", 30.5590, 31.0090, 5, ["شبين الكوم", "shebin el kom", "shibin"]),
+        ("السادات", 30.3660, 30.5300, 8, ["السادات", "sadat"]),
+        ("منوف", 30.4660, 30.9300, 4, ["منوف", "menouf", "monuf"]),
+    ],
+    "البحيرة": [
+        ("دمنهور", 31.0341, 30.4682, 6, ["دمنهور", "damanhur", "damanhour"]),
+        ("كفر الدوار", 31.1330, 30.1300, 4, ["كفر الدوار", "kafr el dawwar", "kafr el-dawwar"]),
+    ],
+    "كفر الشيخ": [
+        ("كفر الشيخ", 31.1107, 30.9388, 7, ["كفر الشيخ", "kafr el sheikh", "kafr el-sheikh", "kafr elsheikh"]),
+        ("دسوق", 31.1333, 30.6500, 4, ["دسوق", "desouk", "disuq"]),
+    ],
+    "بني سويف": [("بني سويف", 29.0661, 31.0994, 7, ["بني سويف", "beni suef", "bani suef"])],
+    "بورسعيد": [("بورسعيد", 31.2653, 32.3019, 7, ["بورسعيد", "port said"])],
+    "السويس": [("السويس", 29.9668, 32.5498, 7, ["السويس", "suez"])],
+    "الإسماعيلية": [("الإسماعيلية", 30.5965, 32.2715, 7, ["الإسماعيلية", "الاسماعيلية", "ismailia"])],
+    "دمياط": [("دمياط", 31.4165, 31.8133, 6, ["دمياط", "damietta"])],
+    "الفيوم": [("الفيوم", 29.3084, 30.8428, 7, ["الفيوم", "fayoum", "faiyum"])],
+    "المنيا": [("المنيا", 28.1099, 30.7503, 7, ["المنيا", "minya", "minia"])],
+    "أسيوط": [("أسيوط", 27.1809, 31.1837, 7, ["أسيوط", "اسيوط", "assiut", "asyut"])],
+    "سوهاج": [("سوهاج", 26.5569, 31.6948, 7, ["سوهاج", "sohag"])],
+    "الأقصر": [("الأقصر", 25.6872, 32.6396, 7, ["الأقصر", "الاقصر", "luxor"])],
+    "قنا": [
+        ("قنا", 26.1551, 32.7160, 7, ["قنا", "qena"]),
+        ("نجع حمادي", 26.0490, 32.2410, 5, ["نجع حمادي", "نجع حمادى", "nag hammadi", "naga hammadi"]),
+    ],
+    "أسوان": [("أسوان", 24.0889, 32.8998, 7, ["أسوان", "اسوان", "aswan"])],
+    "البحر الأحمر": [("الغردقة", 27.2579, 33.8116, 9, ["الغردقة", "hurghada"])],
+    "مطروح": [("مرسى مطروح", 31.3543, 27.2373, 8, ["مطروح", "matrouh", "matruh"])],
+    "جنوب سيناء": [("شرم الشيخ", 27.9158, 34.3300, 10, ["شرم الشيخ", "sharm el sheikh", "sharm el-sheikh"])],
+    "شمال سيناء": [("العريش", 31.1316, 33.7984, 7, ["العريش", "arish"])],
+    "الوادي الجديد": [("الخارجة", 25.4390, 30.5586, 7, ["الخارجة", "kharga", "kharga oasis"])],
+}
+
+REGIONS = {gov: [row[0] for row in rows] for gov, rows in _REGION_ROWS.items()}
 DISTRICT_GEO = {
-    "مدينة نصر": {"center": (30.0626, 31.3300), "radius": 7.0,
-                  "kw": ["مدينة نصر", "مدينه نصر", "nasr city"]},
-    "مصر الجديدة": {"center": (30.0910, 31.3225), "radius": 5.0,
-                    "kw": ["مصر الجديدة", "مصر الجديده", "heliopolis"]},
-    "المعادي": {"center": (29.9602, 31.2569), "radius": 6.0,
-                "kw": ["المعادي", "المعادى", "maadi"]},
-    "التجمع الخامس": {"center": (30.0074, 31.4913), "radius": 9.0,
-                      "kw": ["التجمع", "القاهرة الجديدة", "new cairo", "fifth settlement", "tagamoa"]},
-    "المهندسين": {"center": (30.0561, 31.2000), "radius": 3.5,
-                  "kw": ["المهندسين", "mohandessin", "mohandiseen", "mohandseen"]},
-    "الدقي": {"center": (30.0382, 31.2123), "radius": 3.5,
-              "kw": ["الدقي", "الدقى", "dokki", "dokki"]},
-    "فيصل": {"center": (29.9981, 31.1700), "radius": 5.0,
-             "kw": ["فيصل", "faisal"]},
-    "الهرم": {"center": (29.9870, 31.1376), "radius": 6.0,
-              "kw": ["الهرم", "haram", "pyramids"]},
-    "6 أكتوبر": {"center": (29.9285, 30.9188), "radius": 14.0,
-                 "kw": ["أكتوبر", "اكتوبر", "october"]},
-    "الشيخ زايد": {"center": (30.0197, 30.9760), "radius": 9.0,
-                   "kw": ["الشيخ زايد", "sheikh zayed", "zayed"]},
+    row[0]: {"center": (row[1], row[2]), "radius": float(row[3]), "kw": row[4]}
+    for rows in _REGION_ROWS.values() for row in rows
 }
 
 
@@ -703,17 +835,18 @@ def _place_in_district(place, district):
     return in_addr
 
 
-def _discover_places(district, max_results):
+def _discover_places(district, max_results, governorate=None):
     keywords = [
         "معرض سيارات", "معارض سيارات مستعملة", "تجارة سيارات", "car showroom",
         "بيع وشراء سيارات", "سيارات مستعملة", "car dealer", "used cars",
     ]
     seen, dealers = set(), []
+    label = district if not governorate or governorate == district else f"{district} {governorate}"
 
     for kw in keywords:
-        for page in range(1, 4):
+        for page in range(1, 6):
             data = _serper(SERPER_PLACES, {
-                "q": f"{kw} {district}", "gl": "eg", "hl": "ar", "page": page,
+                "q": f"{kw} {label}", "gl": "eg", "hl": "ar", "page": page,
             })
             places = (data or {}).get("places", [])
             if not places:
@@ -888,11 +1021,11 @@ def _discover_free(district, max_results):
 # الدالة الرئيسية
 # =========================================================
 
-def discover_dealers(district, max_results=10, enrich=True):
+def discover_dealers(district, max_results=10, enrich=True, governorate=None):
     dealers = []
 
     if _key():
-        dealers = _discover_places(district, max_results)
+        dealers = _discover_places(district, max_results, governorate)
     if not dealers:
         dealers = _discover_free(district, max_results)
 
